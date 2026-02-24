@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train Debug",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/train.py",
+            "args": [
+                "pi05_bridge_rlds_finetune_cot",
+                "--exp-name=pi05_bridge",
+                "--overwrite"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "OPENPI_DATA_HOME": "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache",
+                "WANDB_MODE": "offline",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.9"
+            },
+            "python": "${workspaceFolder}/.venv/bin/python"  // 如果 uv 创建了虚拟环境
+        }
+    ]
+}

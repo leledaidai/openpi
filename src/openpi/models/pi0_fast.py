@@ -88,6 +88,10 @@ class Pi0FASTConfig(_model.BaseModelConfig):
     # Keyword arguments for the fast model tokenizer.
     fast_model_tokenizer_kwargs: dict[str, Any] | None = None
 
+    # CoT (Chain-of-Thought) settings.
+    use_cot: bool = False      # Enable CoT reasoning
+    max_cot_tokens: int = 512  # Expected CoT length (used to set token budget)
+
     @property
     @override
     def model_type(self) -> _model.ModelType:

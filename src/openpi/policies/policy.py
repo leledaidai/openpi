@@ -94,6 +94,15 @@ class Policy(BasePolicy):
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
         model_time = time.monotonic() - start_time
+
+        # Add CoT information if available (for debugging/visualization)
+        if hasattr(self._model, "use_cot") and self._model.use_cot:
+            # CoT tokens are generated internally in sample_actions
+            # We could optionally decode and return them here for visualization
+            outputs["cot_enabled"] = True
+        else:
+            outputs["cot_enabled"] = False
+
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:

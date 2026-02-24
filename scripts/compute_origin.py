@@ -16,20 +16,9 @@ import openpi.training.data_loader as _data_loader
 import openpi.transforms as transforms
 
 
-
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
-        """Recursively remove string fields from nested dictionaries."""
-        result = {}
-        for k, v in x.items():
-            if isinstance(v, dict):
-                # Recursively process nested dictionaries
-                result[k] = self.__call__(v)
-            elif not np.issubdtype(np.asarray(v).dtype, np.str_):
-                # Keep non-string fields
-                result[k] = v
-            # Skip string fields (don't add to result)
-        return result
+        return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
 def create_torch_dataloader(
@@ -74,11 +63,7 @@ def create_rlds_dataloader(
     batch_size: int,
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
-    # Skip reasoning loading when computing norm stats (only need state/actions)
-    print("Creating RLDS dataset (skipping reasoning data for faster loading)...")
-    dataset = _data_loader.create_rlds_dataset(
-        data_config, action_horizon, batch_size, shuffle=False, load_reasoning=False
-    )
+    dataset = _data_loader.create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=False)
     dataset = _data_loader.IterableTransformedDataset(
         dataset,
         [
@@ -94,11 +79,11 @@ def create_rlds_dataloader(
     else:
         # NOTE: this length is currently hard-coded for DROID.
         num_batches = len(dataset) // batch_size
-
-    # Don't use RLDSDataLoader because it tries to put data on JAX devices
-    # which doesn't work with string fields. Just return the dataset directly.
-    print(f"Dataset created. Will process {num_batches} batches.")
-    return dataset, num_batches
+    data_loader = _data_loader.RLDSDataLoader(
+        dataset,
+        num_batches=num_batches,
+    )
+    return data_loader, num_batches
 
 
 def main(config_name: str, max_frames: int | None = None):

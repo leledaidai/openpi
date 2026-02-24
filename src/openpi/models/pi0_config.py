@@ -32,6 +32,12 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Chain-of-Thought (CoT) configuration
+    use_cot: bool = False  # Enable/disable CoT reasoning
+    max_cot_tokens: int = 1024  # Maximum CoT sequence length
+    cot_loss_weight: float = 1.0  # Weight for CoT loss relative to action loss
+    reasoning_dropout_prob: float = 0.0  # Dropout probability for CoT during training
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

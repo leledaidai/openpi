@@ -49,6 +49,7 @@ class DroidRldsDataset:
         shuffle_buffer_size: int = 250_000,
         num_parallel_reads: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
         num_parallel_calls: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
+        reasoning_dataset_path: str | None = None,  # Path to reasoning JSON file
     ):
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
@@ -60,6 +61,11 @@ class DroidRldsDataset:
 
         # Ensure dataset weights sum to 1.0
         assert sum(dataset.weight for dataset in datasets) == 1.0, "Dataset weights must sum to 1.0"
+
+        # Load reasoning dataset if provided
+        reasoning_table = None
+        if reasoning_dataset_path is not None:
+            reasoning_table = self._load_reasoning_dataset(reasoning_dataset_path)
 
         def prepare_single_dataset(dataset_cfg: RLDSDataset):
             # ds_name, version = dataset_name.split(":")
@@ -113,8 +119,8 @@ class DroidRldsDataset:
                 )
 
             def restructure(traj):
-                """Reformat observation and action keys, sample language instruction."""
-                # Important: we use joint *position* action space -- easier to simulate!
+                """Reformat observation and action keys for DROID dataset, sample language instruction."""
+                # DROID-specific action handling
                 actions = tf.concat(
                     (
                         (
@@ -126,26 +132,25 @@ class DroidRldsDataset:
                     ),
                     axis=-1,
                 )
-                # Randomly samples one of the two exterior images in DROID during training (we only train with one at a time).
-                # Note: the "left" refers to the left camera in the stereo pair, we only train on the left camera.
+
+                # Randomly samples one of the two exterior images in DROID during training
                 exterior_img = tf.cond(
                     tf.random.uniform(shape=[]) > 0.5,
                     lambda: traj["observation"]["exterior_image_1_left"],
                     lambda: traj["observation"]["exterior_image_2_left"],
                 )
                 wrist_img = traj["observation"]["wrist_image_left"]
+
                 # Randomly sample one of the three language instructions
                 instruction = tf.random.shuffle(
                     [traj["language_instruction"], traj["language_instruction_2"], traj["language_instruction_3"]]
                 )[0]
 
-                traj_len = tf.shape(traj["action"])[0]
+                traj_len = tf.shape(actions)[0]
                 indices = tf.as_string(tf.range(traj_len))
 
                 # Data filtering:
-                # Compute a uniquely-identifying step ID by concatenating the recording folderpath, file path,
-                # and each step's time step index. This will index into the filter hash table, and if it returns true,
-                # then the frame passes the filter.
+                # Compute a uniquely-identifying step ID
                 step_id = (
                     traj["traj_metadata"]["episode_metadata"]["recording_folderpath"]
                     + "--"
@@ -155,17 +160,29 @@ class DroidRldsDataset:
                 )
                 passes_filter = self.filter_table.lookup(step_id)
 
+                # Lookup reasoning if available
+                reasoning = ""
+                if reasoning_table is not None:
+                    file_path = traj["traj_metadata"]["episode_metadata"]["file_path"][0]
+                    episode_id = tf.as_string(traj["traj_metadata"]["episode_metadata"]["episode_id"][0])
+                    reasoning_keys = file_path + "_" + episode_id + "_" + indices
+                    reasoning = reasoning_table.lookup(reasoning_keys)
+
+                # Build observation dict for DROID
+                obs_dict = {
+                    "image": exterior_img,
+                    "wrist_image": wrist_img,
+                    "joint_position": traj["observation"]["joint_position"],
+                    "gripper_position": traj["observation"]["gripper_position"],
+                }
+
                 return {
                     "actions": actions,
-                    "observation": {
-                        "image": exterior_img,
-                        "wrist_image": wrist_img,
-                        "joint_position": traj["observation"]["joint_position"],
-                        "gripper_position": traj["observation"]["gripper_position"],
-                    },
+                    "observation": obs_dict,
                     "prompt": instruction,
                     "step_id": step_id,
                     "passes_filter": passes_filter,
+                    "reasoning": reasoning,
                 }
 
             dataset = dataset.traj_map(restructure, num_parallel_calls)
@@ -221,7 +238,7 @@ class DroidRldsDataset:
 
             return dataset.frame_map(decode_images, num_parallel_calls)
 
-        logging.info(f"Preparing {len(datasets)} datasets...")
+        logging.info(f"Preparing {len(datasets)} DROID datasets...")
         logging.info("-" * 50)
         for dataset in datasets:
             logging.info(f"    {dataset.name}:{dataset.version} with weight {dataset.weight:.2f}")
@@ -246,3 +263,113 @@ class DroidRldsDataset:
         # This is the approximate number of samples in DROID after filtering.
         # Easier to hardcode than to iterate through the dataset and compute it.
         return 20_000_000
+
+    def _load_reasoning_dataset(self, reasoning_dataset_path: str):
+        """Load reasoning dataset from JSON file and create TensorFlow lookup table.
+
+        Args:
+            reasoning_dataset_path: Path to reasoning JSON file (local or HuggingFace)
+
+        Returns:
+            TensorFlow StaticHashTable mapping frame keys to reasoning strings
+        """
+        import tensorflow as tf
+
+        # Download if needed
+        if reasoning_dataset_path.startswith("http") or "::" in reasoning_dataset_path:
+            cached_path = download.maybe_download(reasoning_dataset_path)
+        else:
+            cached_path = reasoning_dataset_path
+
+        # Check if file exists
+        if not Path(cached_path).exists():
+            logging.warning(f"Reasoning dataset not found at {cached_path}, using empty reasoning")
+            return tf.lookup.StaticHashTable(
+                tf.lookup.KeyValueTensorInitializer([""], [""]), default_value=""
+            )
+
+        logging.info(f"Loading reasoning dataset from {cached_path}")
+        with Path(cached_path).open("r") as f:
+            reasoning_dataset = json.load(f)
+
+        # Import CoT utilities
+        from openpi.utils.cot_utils import format_reasoning_dict_to_string
+
+        # Build lookup table
+        keys = []
+        values = []
+        has_reasoning = [0, 0]  # [count without reasoning, count with reasoning]
+
+        logging.info("Building reasoning lookup table for DROID dataset...")
+        for file_name in tqdm.tqdm(reasoning_dataset.keys(), desc="Processing reasoning data"):
+            for episode_id in reasoning_dataset[file_name].keys():
+                episode_data = reasoning_dataset[file_name][episode_id]
+
+                if "reasoning" not in episode_data:
+                    has_reasoning[0] += 1
+                    continue
+
+                has_reasoning[1] += 1
+
+                for frame_idx in episode_data["reasoning"].keys():
+                    reasoning_dict = episode_data["reasoning"][frame_idx]
+
+                    # Add gripper position if available
+                    if "features" in episode_data and "gripper_position" in episode_data["features"]:
+                        gripper_positions = episode_data["features"]["gripper_position"]
+                        if gripper_positions is not None and int(frame_idx) < len(gripper_positions):
+                            # Look ahead a few frames for gripper trajectory
+                            gripper_lookahead = 5
+                            future_positions = []
+                            for j in range(gripper_lookahead):
+                                if int(frame_idx) + j < len(gripper_positions):
+                                    future_positions.extend(gripper_positions[int(frame_idx) + j])
+                                else:
+                                    # Repeat last position
+                                    future_positions.extend(future_positions[-2:] if future_positions else [0, 0])
+                            reasoning_dict["gripper"] = str(future_positions)
+                        else:
+                            reasoning_dict["gripper"] = ""
+                    else:
+                        reasoning_dict["gripper"] = ""
+
+                    # Add bounding boxes if available
+                    if "features" in episode_data and "bboxes" in episode_data["features"]:
+                        bboxes = episode_data["features"]["bboxes"]
+                        if bboxes is not None and int(frame_idx) < len(bboxes):
+                            if len(bboxes[int(frame_idx)]) > 0:
+                                boxes_list = bboxes[int(frame_idx)]
+                                reasoning_dict["bboxes"] = ", ".join(
+                                    [f"{name} {box}" for prob, name, box in boxes_list]
+                                )
+                            else:
+                                reasoning_dict["bboxes"] = ""
+                        else:
+                            reasoning_dict["bboxes"] = ""
+                    else:
+                        reasoning_dict["bboxes"] = ""
+
+                    # Format reasoning dict to string
+                    reasoning_str = format_reasoning_dict_to_string(reasoning_dict)
+
+                    # Create key: file_name_episode_id_frame_idx
+                    key = f"{file_name}_{episode_id}_{frame_idx}"
+                    keys.append(key)
+                    values.append(reasoning_str)
+
+        logging.info(f"Reasoning lookup table built with {len(keys)} entries")
+        logging.info(f"Reasoning presence statistics [# without, # with]: {has_reasoning}")
+        if keys:
+            logging.info(f"Example reasoning key: {keys[0]}")
+            logging.info(f"Example reasoning value: {values[0][:200]}...")
+
+        # Create TensorFlow lookup table
+        if not keys:
+            logging.warning("No reasoning data found, using empty table")
+            return tf.lookup.StaticHashTable(
+                tf.lookup.KeyValueTensorInitializer([""], [""]), default_value=""
+            )
+
+        return tf.lookup.StaticHashTable(
+            tf.lookup.KeyValueTensorInitializer(keys, values), default_value=""
+        )

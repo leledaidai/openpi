@@ -1,0 +1,974 @@
+diff --git a/prismatic/extern/hf/modeling_prismatic.py b/prismatic/extern/hf/modeling_prismatic.py
+index 4a26c48..70c97ea 100644
+--- a/prismatic/extern/hf/modeling_prismatic.py
++++ b/prismatic/extern/hf/modeling_prismatic.py
+@@ -506,16 +506,16 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
+     def predict_action(
+         self, input_ids: Optional[torch.LongTensor] = None, unnorm_key: Optional[str] = None, **kwargs: str
+     ) -> np.ndarray:
+-        """Thin wrapper around .generate() that decodes predicted actions and unnormalizes them."""
+-        # If the special empty token ('') does not already appear after the colon (':') token in the prompt
+-        # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
+-        if not torch.all(input_ids[:, -1] == 29871):
+-            input_ids = torch.cat(
+-                (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
+-            )
++        """Thin wrapper around super().generate() that decodes predicted actions and de-normalizes them."""
++
++        # We need to add this special empty token ('') after the colon (':') token in "ASSISTANT:"
++        # in order for the predictions to match the training configuration and be accurate.
++        # input_ids = torch.cat(
++        #     (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
++        # )
+ 
+         # Run VLA inference
+-        generated_ids = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)
++        generated_ids = self.generate(input_ids, **kwargs)
+ 
+         # Extract predicted action tokens and translate into (normalized) continuous actions
+         predicted_action_token_ids = generated_ids[0, -self.get_action_dim(unnorm_key) :].cpu().numpy()
+@@ -533,22 +533,25 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
+             normalized_actions,
+         )
+ 
+-        return actions
++        return actions, generated_ids
+ 
+     @staticmethod
+     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:
+-        if unnorm_key is None:
+-            assert len(norm_stats) == 1, (
+-                f"Your model was trained on more than one dataset, "
+-                f"please pass a `unnorm_key` from the following options to choose the statistics "
+-                f"used for un-normalizing actions: {norm_stats.keys()}"
++        if unnorm_key is None and len(norm_stats) != 1:
++            raise ValueError(
++                f"Your model was trained on more than one dataset. "
++                f"Please pass a `unnorm_key` from the following options to choose the statistics used for "
++                f"de-normalizing actions: {norm_stats.keys()}"
++            )
++
++        # If None, grab the (singular) dataset in `norm_stats` to use as `unnorm_key`
++        unnorm_key = unnorm_key if unnorm_key is not None else next(iter(norm_stats.keys()))
++        if unnorm_key not in norm_stats:
++            raise ValueError(
++                f"The `unnorm_key` you chose ({unnorm_key = }) is not in the available statistics. "
++                f"Please choose from: {norm_stats.keys()}"
+             )
+-            unnorm_key = next(iter(norm_stats.keys()))
+ 
+-        assert unnorm_key in norm_stats, (
+-            f"The `unnorm_key` you chose is not in the set of available dataset statistics, "
+-            f"please choose from: {norm_stats.keys()}"
+-        )
+         return unnorm_key
+ 
+     def get_action_dim(self, unnorm_key: Optional[str] = None) -> int:
+diff --git a/prismatic/models/vlas/openvla.py b/prismatic/models/vlas/openvla.py
+index 58ee0f9..7e79f94 100644
+--- a/prismatic/models/vlas/openvla.py
++++ b/prismatic/models/vlas/openvla.py
+@@ -1,10 +1,6 @@
+-"""
+-openvla.py
+-
+-PyTorch Module defining OpenVLA as a lightweight wrapper around a PrismaticVLM; defines custom logic around
+-discretizing actions with the ActionTokenizer.
+-"""
++from __future__ import annotations
+ 
++import time
+ from typing import Dict, List, Optional
+ 
+ import numpy as np
+@@ -12,8 +8,10 @@ import torch
+ from PIL import Image
+ from transformers import LlamaTokenizerFast
+ 
++from experiments.bridge.reasoning_client import ReasoningClient
+ from prismatic.models.vlms.prismatic import PrismaticVLM
+ from prismatic.overwatch import initialize_overwatch
++from prismatic.util.cot_utils import CotTag
+ from prismatic.vla.action_tokenizer import ActionTokenizer
+ 
+ # Initialize Overwatch =>> Wraps `logging.Logger`
+@@ -32,12 +30,57 @@ class OpenVLA(PrismaticVLM):
+         self.norm_stats = norm_stats
+         self.action_tokenizer = action_tokenizer
+ 
++        self.use_cot = True
++        self.use_async = False
++        self.use_interactive = False
++
++        self.base_prompt = f"{CotTag.TASK.value}"
++
++        self.max_freezing_time = 5
++        self.time_frozen = 0
++        self.frozen_prompt = self.base_prompt
++
++        if self.use_async:
++            self.reasoning_client = ReasoningClient()
++            self.last_reasoning = None
++            self.pending = False
++            self.prev_time = time.time()
++            self.local_trials = 0
++
++    def raw_generate(self, input_ids, pixel_values):
++        if isinstance(pixel_values, torch.Tensor):
++            pixel_values = pixel_values.to(self.device).bfloat16()
++        elif isinstance(pixel_values, dict):
++            pixel_values = {k: v.to(self.device).bfloat16() for k, v in pixel_values.items()}
++
++        return super(PrismaticVLM, self).generate(
++            input_ids=input_ids.to(self.device),
++            pixel_values=pixel_values,
++            max_new_tokens=1024,
++        )
++
++    def reset_async(self):
++        self.time_frozen = 0
++        if self.use_async:
++            self.reasoning_client = ReasoningClient()
++            self.last_reasoning = None
++            self.pending = False
++            self.local_trials = 0
++
++    def enable_cot(self, enable: bool):
++        self.use_cot = enable
++
+     @torch.inference_mode()
+     def predict_action(
+-        self, image: Image, instruction: str, unnorm_key: Optional[str] = None, **kwargs: str
++        self,
++        image: Image,
++        instruction: str,
++        unnorm_key: Optional[str] = None,
++        info_dict: Optional[dict] = None,
++        **kwargs: str,
+     ) -> np.ndarray:
+         """
+-        Core function for VLA inference; maps input image and task instruction to continuous action (de-tokenizes).
++        Core function for VLA inference; maps input image and task instruction to continuous action and reasoning.
+ 
+         @param image: PIL Image as [height, width, 3]
+         @param instruction: Task instruction string
+@@ -48,22 +91,26 @@ class OpenVLA(PrismaticVLM):
+         """
+         image_transform, tokenizer = self.vision_backbone.image_transform, self.llm_backbone.tokenizer
+ 
+-        # Build VLA Prompt
++        # Build VLA prompt
+         prompt_builder = self.get_prompt_builder()
+         prompt_builder.add_turn(role="human", message=f"What action should the robot take to {instruction.lower()}?")
+         prompt_text = prompt_builder.get_prompt()
+ 
+         # Prepare Inputs
+-        input_ids = tokenizer(prompt_text, truncation=True, return_tensors="pt").input_ids.to(self.device)
+-        if isinstance(tokenizer, LlamaTokenizerFast):
+-            # If the special empty token ('') does not already appear after the colon (':') token in the prompt
+-            # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
+-            if not torch.all(input_ids[:, -1] == 29871):
+-                input_ids = torch.cat(
+-                    (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
++        init_input_ids = tokenizer(prompt_text, truncation=True, return_tensors="pt").input_ids.to(self.device)
++
++        def build_prompt(prompt_prefix, input_ids):
++            if isinstance(tokenizer, LlamaTokenizerFast):
++                # Note: We start the answer with "TASK:" to force generating the reasoning part.
++                return torch.cat(
++                    (
++                        input_ids,
++                        tokenizer(prompt_prefix, return_tensors="pt").input_ids.to(self.device)[:, 1:],
++                    ),
++                    dim=1,
+                 )
+-        else:
+-            raise ValueError(f"Unsupported `tokenizer` type = {type(tokenizer)}")
++            else:
++                raise ValueError(f"Unsupported `tokenizer` type = {type(tokenizer)}")
+ 
+         # Preprocess Image
+         pixel_values = image_transform(image)
+@@ -78,12 +125,91 @@ class OpenVLA(PrismaticVLM):
+         autocast_dtype = self.llm_backbone.half_precision_dtype
+         with torch.autocast("cuda", dtype=autocast_dtype, enabled=self.enable_mixed_precision_training):
+             # fmt: off
+-            generated_ids = super(PrismaticVLM, self).generate(
+-                input_ids=input_ids,                            # Shape: [1, seq]
+-                pixel_values=pixel_values,                      # Shape: [1, 3, res, res] or Dict[str, ...]
+-                max_new_tokens=self.get_action_dim(unnorm_key),
+-                **kwargs
+-            )
++            if self.use_async:
++                if self.local_trials >= 4:
++                    self.local_trials = 0
++                    self.reasoning_client.join()
++
++                if self.pending and self.reasoning_client.done():
++                    self.pending = False
++                    self.local_trials = 0
++
++                    generated_ids = self.reasoning_client.get_result()
++                    decoded_tokens = self.llm_backbone.tokenizer.decode(generated_ids[0, :-1])
++
++                    self.last_reasoning = decoded_tokens.split("ASSISTANT:")[-1].strip()  # for siglip
++                    self.last_reasoning = decoded_tokens.split("\nOut: ")[-1].strip()  # for prism-dinosiglip
++
++                    self.last_reasoning = \
++                        self.last_reasoning.split(CotTag.MOVE_REASONING.value)[0] + CotTag.MOVE_REASONING.value + " "
++
++                if not self.pending:
++                    self.reasoning_client.request((build_prompt(self.base_prompt, init_input_ids), pixel_values))
++                    self.pending = True
++
++                if self.last_reasoning is not None:
++                    generated_ids = self.raw_generate(build_prompt(self.last_reasoning, init_input_ids), pixel_values)
++                    self.local_trials += 1
++                else:
++                    # first step, wait for the full reasoning
++                    self.reasoning_client.join()
++                    generated_ids = self.reasoning_client.get_result()
++            else:
++                if self.use_interactive:
++                    import pyautogui
++                    prompt = self.base_prompt
++
++                    while True:
++                        generated_ids = self.raw_generate(build_prompt(prompt, init_input_ids), pixel_values)
++                        decoded_tokens = self.llm_backbone.tokenizer.decode(generated_ids[0, :-1])
++
++                        prompt = decoded_tokens.split("\nOut: ")[-1]
++                        prompt = prompt.split(" ASSISTANT: ")[-1]
++                        prompt = prompt.split(" ACTION: ")[0].replace('\n', ' ')
++
++                        print(
++                            f"\nProposed reasoning: {prompt}\n\n[Leave unchanged to accept, or modify to regenerate]\n"
++                            "[type \"[continue]\" to accept and exit the interactive mode]\n"
++                            "[Use [Ctrl]+[left/right] to navigate the text, [Ctrl]+w to delete a word, "
++                            "[Ctrl]+u to delete a line]\n")
++                        pyautogui.write(prompt)
++                        user_response = input()
++
++                        if user_response == "[continue]":
++                            print('\033[92m\033[1mReasoning accepted!\033[0m')
++                            self.use_interactive = False
++                            break
++                        elif user_response == prompt:
++                            print('\033[92m\033[1mReasoning accepted!\033[0m')
++                            break
++                        else:
++                            prompt = user_response
++                else:
++                    # run generate and wait for the result
++                    print(f"Prompt freezing: {self.time_frozen} turns left.")
++                    if self.time_frozen <= 0:
++                        self.frozen_prompt = self.base_prompt
++                        self.time_frozen = self.max_freezing_time
++
++                    self.time_frozen -= 1
++                    generated_ids = self.raw_generate(build_prompt(self.frozen_prompt, init_input_ids), pixel_values)
++
++                    decoded_tokens = self.llm_backbone.tokenizer.decode(generated_ids[0, :-1])
++                    prompt = decoded_tokens.split("\nOut: ")[-1]
++                    prompt = prompt.split(" ASSISTANT: ")[-1]
++
++                    if " MOVE REASONING: " in prompt:
++                        prompt = prompt.split(" MOVE REASONING: ")[0]
++                    else:
++                        prompt = prompt.split(" GRIPPER POSITION: ")[0]
++                    self.frozen_prompt = prompt
++
++            generated_ids = generated_ids[:, :-1]  # remove the EOS token
++            decoded_tokens = self.llm_backbone.tokenizer.decode(generated_ids[0])
++
++            print("Reasoning:", decoded_tokens)
++            if info_dict is not None:
++                info_dict["decoded_tokens"] = decoded_tokens
+             # fmt: on
+ 
+         # Extract predicted action tokens and translate into (normalized) continuous actions
+diff --git a/prismatic/training/metrics.py b/prismatic/training/metrics.py
+index 9dc86ed..5255d82 100644
+--- a/prismatic/training/metrics.py
++++ b/prismatic/training/metrics.py
+@@ -241,11 +241,14 @@ class VLAMetrics:
+         self.global_step = 0 if resume_step is None else resume_step
+         self.epoch = 0 if resume_epoch is None else resume_epoch
+         self.start_time, self.step_start_time = time.time(), time.time()
++        self.deque_window_size = window_size
++
+         self.state = {
+             "loss_raw": deque(maxlen=grad_accumulation_steps),
+             "loss": deque(maxlen=window_size),
+             "l1_loss": deque(maxlen=window_size),
+             "action_accuracy": deque(maxlen=window_size),
++            "cot_accuracy": deque(maxlen=window_size),
+             "step_time": deque(maxlen=window_size),
+             "lr": [],
+         }
+@@ -300,6 +303,8 @@ class VLAMetrics:
+                 self.state["loss_raw"].append(loss_val)
+                 self.state["loss"].append(loss_val)
+             else:
++                if key not in self.state.keys():
++                    self.state[key] = deque(maxlen=self.deque_window_size)
+                 self.state[key].append(value.detach())
+ 
+     def commit_for_dataset(self, dataset_name: str, **kwargs) -> None:
+@@ -312,6 +317,7 @@ class VLAMetrics:
+         loss = torch.stack(list(self.state["loss"])).mean().item()
+         l1_loss = torch.stack(list(self.state["l1_loss"])).mean().item()
+         action_accuracy = torch.stack(list(self.state["action_accuracy"])).mean().item()
++        cot_accuracy = torch.stack(list(self.state["cot_accuracy"])).mean().item()
+         step_time, lr = np.mean(list(self.state["step_time"])), self.state["lr"][-1]
+         status = self.get_status(loss)
+ 
+@@ -327,6 +333,14 @@ class VLAMetrics:
+ 
+         # Fire to Trackers
+         prefix = "VLA Train"
++
++        tag_accuracy_metrics = {
++            f"{prefix}/{key}": torch.stack(list(self.state[key])).mean().item()
++            for key in self.state.keys()
++            if "tag_accuracy" in key
++        }
++
++        # Fire to Trackers
+         self.log(
+             self.global_step,
+             metrics={
+@@ -335,14 +349,16 @@ class VLAMetrics:
+                 f"{prefix}/Loss": loss,
+                 f"{prefix}/L1 Loss": l1_loss,
+                 f"{prefix}/Action Token Accuracy": action_accuracy,
++                f"{prefix}/CoT Token Accuracy": cot_accuracy,
+                 f"{prefix}/Loss (Raw)": loss_raw,
+                 f"{prefix}/Learning Rate": lr,
+                 f"{prefix}/Step Time": step_time,
+                 **dataset_metrics,
++                **tag_accuracy_metrics,
+             },
+         )
+         return status
+ 
+-    def finalize(self) -> str:
++    def finalize(self):
+         for tracker in self.trackers:
+             tracker.finalize()
+diff --git a/prismatic/training/strategies/base_strategy.py b/prismatic/training/strategies/base_strategy.py
+index 018ee41..c4fc9fb 100644
+--- a/prismatic/training/strategies/base_strategy.py
++++ b/prismatic/training/strategies/base_strategy.py
+@@ -23,12 +23,16 @@ from prismatic.overwatch import initialize_overwatch
+ from prismatic.training.metrics import Metrics, VLAMetrics
+ from prismatic.util import check_bloat16_supported
+ from prismatic.util.batching_utils import SplitModalitySampler
++from prismatic.util.cot_utils import get_cot_tags_list
+ from prismatic.util.data_utils import PaddedCollatorForActionPrediction, PaddedCollatorForLanguageModeling
+ from prismatic.vla.action_tokenizer import ActionTokenizer
+ 
+ # Initialize Overwatch =>> Wraps `logging.Logger`
+ overwatch = initialize_overwatch(__name__)
+ 
++# LLaMA EOS Token
++EOS_TOKEN = 2
++
+ 
+ # === Abstract Base Class for an arbitrary Training Strategy ===
+ class TrainingStrategy(ABC):
+@@ -311,41 +315,131 @@ class TrainingStrategy(ABC):
+                 #   2) Compute boolean "mask" where "labels > 2" (where 2 is ID for `EOS_TOKEN`)
+                 #           => If masking out EOS, then it's just "labels != -100 (IGNORE_INDEX)
+                 #   3) Compute masked accuracy as `(preds == logits) & mask` --> sum/divide by # unmasked!
+-                action_preds = output.logits[:, self.vlm.vision_backbone.num_patches : -1].argmax(dim=2)
+-                action_gt = batch["labels"][:, 1:].to(action_preds.device)
+-                mask = action_gt > action_tokenizer.action_token_begin_idx
++
++                token_preds = output.logits[:, self.vlm.vision_backbone.num_patches : -1].argmax(dim=2)
++                token_gt = batch["labels"][:, 1:].to(token_preds.device)
++                action_mask = token_gt > action_tokenizer.action_token_begin_idx
++
++                def get_masks(tokens, tags):
++                    tag_tokens = dict()
++
++                    for tag in tags:
++                        encoded_tags = self.vlm.llm_backbone.tokenizer.encode_plus(tag, return_tensors="pt")
++                        tag_ids = encoded_tags["input_ids"][0]
++                        tag_tokens[tag] = tag_ids[1:].to(tokens.device)
++
++                    tag_masks = dict()
++                    prev_tag = None
++                    prev_pos = 0
++
++                    def make_mask(a, b):
++                        mask = torch.zeros_like(tokens)
++                        mask[a:b] = 1
++                        return mask
++
++                    for i in range(len(tokens) - 1):
++                        for tag, tag_ids in tag_tokens.items():
++                            if i + len(tag_ids) > len(tokens):
++                                continue
++
++                            if torch.all(tokens[i : i + len(tag_ids)] == tag_ids):
++                                tag_masks[prev_tag] = make_mask(prev_pos, i)
++                                prev_tag = tag
++                                prev_pos = i + len(tag_ids)
++
++                    tag_masks[prev_tag] = make_mask(prev_pos, len(tokens))
++
++                    for tag in tags:
++                        if tag not in tag_masks:
++                            tag_masks[tag] = make_mask(0, 0)
++
++                    return tag_masks
++
++                prompt_tags = get_cot_tags_list()
++
++                def get_final_masks(tokens, tags):
++                    final_masks = {tag: [] for tag in tags}
++
++                    for group in tokens:
++                        group_masks = get_masks(group, tags)
++
++                        for tag in tags:
++                            final_masks[tag].append(group_masks[tag])
++
++                    for tag in tags:
++                        final_masks[tag] = torch.stack(final_masks[tag], dim=0)
++
++                    return final_masks
++
++                # Dense reasoning metrics
++                if metrics.global_step % 100 == 0:
++                    final_pred_masks = get_final_masks(token_preds, prompt_tags)
++                    final_gt_masks = get_final_masks(token_gt, prompt_tags)
++
++                    # Compute accuracy for each tag
++                    for tag in prompt_tags:
++                        correct_tags = [0, 0]
++
++                        for reasoning_pred, mask_pred, reasoning_gt, mask_gt in zip(
++                            token_preds, final_pred_masks[tag], token_gt, final_gt_masks[tag]
++                        ):
++                            tag_pred = torch.masked_select(reasoning_pred, mask_pred.bool())
++                            tag_gt = torch.masked_select(reasoning_gt, mask_gt.bool())
++
++                            max_size = max(len(tag_pred), len(tag_gt))
++                            tag_pred = torch.nn.functional.pad(tag_pred, (0, max_size - len(tag_pred)))
++                            tag_gt = torch.nn.functional.pad(tag_gt, (0, max_size - len(tag_gt)))
++
++                            correct_tags[0] += (tag_pred == tag_gt).sum().float()
++                            correct_tags[1] += len(tag_gt)
++
++                        if correct_tags[1] > 0:
++                            tag_accuracy = correct_tags[0] / correct_tags[1]
++                            metrics.commit(**{f"{tag[:-1].lower()}_tag_accuracy": tag_accuracy})
+ 
+                 # Compute Accuracy
+-                correct_preds = (action_preds == action_gt) & mask
+-                action_accuracy = correct_preds.sum().float() / mask.sum().float()
++                correct_action_preds = (token_preds == token_gt) & action_mask
++                action_accuracy = correct_action_preds.sum().float() / action_mask.sum().float()
+ 
+                 # Compute L1 Loss on Predicted (Continuous) Actions
+                 continuous_actions_pred = torch.tensor(
+-                    action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy())
++                    action_tokenizer.decode_token_ids_to_actions(token_preds[action_mask].cpu().numpy())
+                 )
+                 continuous_actions_gt = torch.tensor(
+-                    action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy())
++                    action_tokenizer.decode_token_ids_to_actions(token_gt[action_mask].cpu().numpy())
+                 )
+                 action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
+ 
++                # Compute Accuracy on non-action (ie CoT) tokens
++                cot_mask = (token_gt > EOS_TOKEN) & ~action_mask
++                correct_cot_preds = (token_preds == token_gt) & cot_mask
++                cot_accuracy = correct_cot_preds.sum().float() / cot_mask.sum().float()
++
+                 # Commit Metrics
+-                metrics.commit(action_accuracy=action_accuracy, l1_loss=action_l1_loss, update_step_time=True)
++                metrics.commit(
++                    action_accuracy=action_accuracy,
++                    cot_accuracy=cot_accuracy,
++                    l1_loss=action_l1_loss,
++                    update_step_time=True,
++                )
+ 
+-                # Compute metrics per dataset --> only on rank_zero since we don't log them on other workers anyways
++                # Compute metrics per dataset --> only on rank_zero since we don't log them on other workers anyway
+                 if overwatch.is_rank_zero():
+                     datasets = set(batch["dataset_names"])
+                     if len(datasets) > 1:
+                         for ds in datasets:
+                             ds_mask = torch.tensor([elem == ds for elem in batch["dataset_names"]])
+-                            action_accuracy_ds = correct_preds[ds_mask].sum().float() / mask[ds_mask].sum().float()
++                            action_accuracy_ds = (
++                                correct_action_preds[ds_mask].sum().float() / action_mask[ds_mask].sum().float()
++                            )
+                             continuous_actions_pred_ds = torch.tensor(
+                                 action_tokenizer.decode_token_ids_to_actions(
+-                                    action_preds[ds_mask][mask[ds_mask]].cpu().numpy()
++                                    token_preds[ds_mask][action_mask[ds_mask]].cpu().numpy()
+                                 )
+                             )
+                             continuous_actions_gt_ds = torch.tensor(
+                                 action_tokenizer.decode_token_ids_to_actions(
+-                                    action_gt[ds_mask][mask[ds_mask]].cpu().numpy()
++                                    token_gt[ds_mask][action_mask[ds_mask]].cpu().numpy()
+                                 )
+                             )
+                             action_l1_loss_ds = torch.nn.functional.l1_loss(
+diff --git a/prismatic/util/cot_utils.py b/prismatic/util/cot_utils.py
+new file mode 100644
+index 0000000..502f9ab
+--- /dev/null
++++ b/prismatic/util/cot_utils.py
+@@ -0,0 +1,45 @@
++import enum
++
++
++class CotTag(enum.Enum):
++    TASK = "TASK:"
++    PLAN = "PLAN:"
++    VISIBLE_OBJECTS = "VISIBLE OBJECTS:"
++    SUBTASK_REASONING = "SUBTASK REASONING:"
++    SUBTASK = "SUBTASK:"
++    MOVE_REASONING = "MOVE REASONING:"
++    MOVE = "MOVE:"
++    GRIPPER_POSITION = "GRIPPER POSITION:"
++    ACTION = "ACTION:"
++
++
++def abbreviate_tag(tag: str):
++    return tag[0] + tag[-2]
++
++
++def get_cot_tags_list():
++    return [
++        CotTag.TASK.value,
++        CotTag.PLAN.value,
++        CotTag.VISIBLE_OBJECTS.value,
++        CotTag.SUBTASK_REASONING.value,
++        CotTag.SUBTASK.value,
++        CotTag.MOVE_REASONING.value,
++        CotTag.MOVE.value,
++        CotTag.GRIPPER_POSITION.value,
++        CotTag.ACTION.value,
++    ]
++
++
++def get_cot_database_keys():
++    return {
++        CotTag.TASK.value: "task",
++        CotTag.PLAN.value: "plan",
++        CotTag.VISIBLE_OBJECTS.value: "bboxes",
++        CotTag.SUBTASK_REASONING.value: "subtask_reason",
++        CotTag.SUBTASK.value: "subtask",
++        CotTag.MOVE_REASONING.value: "move_reason",
++        CotTag.MOVE.value: "move",
++        CotTag.GRIPPER_POSITION.value: "gripper",
++        CotTag.ACTION.value: "action",
++    }
+diff --git a/prismatic/vla/datasets/datasets.py b/prismatic/vla/datasets/datasets.py
+index 539b414..8282ca8 100644
+--- a/prismatic/vla/datasets/datasets.py
++++ b/prismatic/vla/datasets/datasets.py
+@@ -5,6 +5,7 @@ Lightweight PyTorch Dataset Definition for wrapping RLDS TFDS Pipeline; just def
+ format to OpenVLA, IterableDataset shim.
+ """
+ 
++import os
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Dict, Tuple, Type
+@@ -17,6 +18,7 @@ from transformers import PreTrainedTokenizerBase
+ 
+ from prismatic.models.backbones.llm.prompting import PromptBuilder
+ from prismatic.models.backbones.vision import ImageTransform
++from prismatic.util.cot_utils import CotTag, abbreviate_tag
+ from prismatic.util.data_utils import tree_map
+ from prismatic.vla.action_tokenizer import ActionTokenizer
+ from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
+@@ -27,6 +29,33 @@ from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
+ IGNORE_INDEX = -100
+ 
+ 
++def reasoning_dropout(reasoning: str, dropout_prob: float) -> Tuple[str, str]:
++    """Dropout reasoning tokens with probability `dropout_prob`."""
++    if len(reasoning) == 0:
++        return reasoning, ""
++
++    reasoning_parts = reasoning.split("@")
++    tags = [(reasoning_parts[i], reasoning_parts[i + 1]) for i in range(0, len(reasoning_parts), 2)]
++
++    subset = np.random.rand(len(tags)) > dropout_prob
++
++    subset_string = (
++        "[" + ", ".join([abbreviate_tag(tag) for (tag, _), is_taken in zip(tags, subset) if is_taken]) + "]"
++    )  # abbreviation
++
++    excluded_tags = []
++
++    if "EXCLUDE_TAGS" in os.environ:
++        excluded_tags = os.environ["EXCLUDE_TAGS"].split(",")
++
++    return (
++        " ".join(
++            [f"{tag[0]} {tag[1]}" for tag, is_taken in zip(tags, subset) if (is_taken and tag[0] not in excluded_tags)]
++        ),
++        subset_string,
++    )
++
++
+ @dataclass
+ class RLDSBatchTransform:
+     action_tokenizer: ActionTokenizer
+@@ -34,22 +63,36 @@ class RLDSBatchTransform:
+     image_transform: ImageTransform
+     prompt_builder_fn: Type[PromptBuilder]
+     predict_stop_token: bool = True
++    print_prompt_limit: int = 20
++    reasoning_dropout_prob: float = 0.0
+ 
+     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
+         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
+         dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
+         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+         lang = rlds_batch["task"]["language_instruction"].decode().lower()
++        reasoning, subset = reasoning_dropout(rlds_batch["reasoning"].decode(), dropout_prob=self.reasoning_dropout_prob)
+ 
+         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
+         prompt_builder = self.prompt_builder_fn("openvla")
++
++        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+         conversation = [
++            # {"from": "human", "value": f"What action should the robot take to {lang}? Explain why with {subset}."},
+             {"from": "human", "value": f"What action should the robot take to {lang}?"},
+-            {"from": "gpt", "value": self.action_tokenizer(action)},
++            {"from": "gpt", "value": f"{reasoning} {CotTag.ACTION.value} {self.action_tokenizer(action)}"},
+         ]
++
+         for turn in conversation:
+             prompt_builder.add_turn(turn["from"], turn["value"])
+ 
++        if self.print_prompt_limit > 0:
++            print("Conversation:", conversation)
++            p = prompt_builder.get_prompt()
++            print("Prompt:", p)
++
++            self.print_prompt_limit -= 1
++
+         # Tokenize (w/ `base_tokenizer`)
+         input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
+         labels = list(input_ids)
+@@ -59,8 +102,6 @@ class RLDSBatchTransform:
+         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
+         pixel_values = self.image_transform(img)
+ 
+-        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
+-        labels[: -(len(action) + 1)] = IGNORE_INDEX
+         if not self.predict_stop_token:
+             labels[-1] = IGNORE_INDEX
+ 
+diff --git a/prismatic/vla/datasets/rlds/dataset.py b/prismatic/vla/datasets/rlds/dataset.py
+index e9bcd93..48b43a0 100644
+--- a/prismatic/vla/datasets/rlds/dataset.py
++++ b/prismatic/vla/datasets/rlds/dataset.py
+@@ -7,6 +7,8 @@ Core interface script for configuring and initializing RLDS datasets.
+ import copy
+ import inspect
+ import json
++import os
++import shutil
+ from functools import partial
+ from typing import Callable, Dict, List, Optional, Tuple, Union
+ 
+@@ -14,8 +16,10 @@ import dlimp as dl
+ import numpy as np
+ import tensorflow as tf
+ import tensorflow_datasets as tfds
++from huggingface_hub import hf_hub_download
+ 
+ from prismatic.overwatch import initialize_overwatch
++from prismatic.util.cot_utils import get_cot_database_keys, get_cot_tags_list
+ from prismatic.vla.datasets.rlds import obs_transforms, traj_transforms
+ from prismatic.vla.datasets.rlds.utils import goal_relabeling, task_augmentation
+ from prismatic.vla.datasets.rlds.utils.data_utils import (
+@@ -53,6 +57,7 @@ def make_dataset_from_rlds(
+     action_normalization_mask: Optional[List[bool]] = None,
+     num_parallel_reads: int = tf.data.AUTOTUNE,
+     num_parallel_calls: int = tf.data.AUTOTUNE,
++    reasoning_dataset_path: str = "~/.cache/reasonings_dataset.json",
+ ) -> Tuple[dl.DLataset, dict]:
+     """
+     This function is responsible for loading a specific RLDS dataset from storage and getting it into a standardized
+@@ -128,6 +133,83 @@ def make_dataset_from_rlds(
+     if language_key is not None:
+         REQUIRED_KEYS.add(language_key)
+ 
++    if os.path.isfile(reasoning_dataset_path):
++        print(f"Loading from local checkpoint path `{reasoning_dataset_path}`.")
++    else:
++        print(f"Dataset file `{reasoning_dataset_path}` not found, loading from HF.")
++
++        download_path = hf_hub_download(
++            repo_id="Embodied-CoT/embodied_features_bridge",
++            filename="embodied_features_bridge.json",
++            repo_type="dataset",
++        )
++
++        shutil.copyfile(download_path, reasoning_dataset_path)
++
++    with open(reasoning_dataset_path, "r") as f:
++        reasoning_dataset = json.load(f)
++
++    def make_tf_dict(raw_dict):
++        print("Building the reasoning dict...")
++        keys = []
++        values = []
++
++        def reasoning_dict_to_str(d):
++            tags = get_cot_tags_list()[:-1]  # exclude ACTION
++            database_keys = get_cot_database_keys()
++            reasoning_parts = [(tag, d[database_keys[tag]]) for tag in tags]
++
++            return "@".join(f"{tag}@{part}" for tag, part in reasoning_parts)
++
++        has_reasoning = [0, 0]
++
++        for file_name in raw_dict.keys():
++            for episode_id in raw_dict[file_name].keys():
++                if "reasoning" not in raw_dict[file_name][episode_id].keys():
++                    has_reasoning[0] += 1
++                    continue
++                else:
++                    has_reasoning[1] += 1
++
++                for i in raw_dict[file_name][episode_id]["reasoning"].keys():
++                    keys.append(file_name + "_" + str(episode_id) + "_" + i)
++                    reasoning_dict = raw_dict[file_name][episode_id]["reasoning"][i]
++
++                    gripper_lookahead_n = 5  # list this many future positions of the gripper
++                    trajectory_features = raw_dict[file_name][episode_id]["features"]
++
++                    reasoning_dict["gripper"] = ""
++                    if "gripper_position" in trajectory_features.keys():
++                        if trajectory_features["gripper_position"] is not None:
++                            if 0 <= int(i) < len(trajectory_features["gripper_position"]):
++                                future_positions = []
++                                for j in range(gripper_lookahead_n):
++                                    if int(i) + j < len(trajectory_features["gripper_position"]):
++                                        future_positions += trajectory_features["gripper_position"][int(i) + j]
++                                    else:
++                                        future_positions += future_positions[-2:]
++
++                                reasoning_dict["gripper"] = str(future_positions)
++
++                    reasoning_dict["bboxes"] = ""
++                    if "bboxes" in trajectory_features.keys():
++                        if trajectory_features["bboxes"] is not None:
++                            if 0 <= int(i) < len(trajectory_features["bboxes"]):
++                                if len(trajectory_features["bboxes"][int(i)]) > 0:
++                                    boxes_list = trajectory_features["bboxes"][int(i)]
++                                    reasoning_dict["bboxes"] = ", ".join(
++                                        [f"{name} {box!s}" for prob, name, box in boxes_list]
++                                    )
++
++                    values.append(reasoning_dict_to_str(reasoning_dict))
++
++        print("Example reasoning:", keys[0], values[0])
++        print("Reasoning presence statistics [# has not, # has]:", has_reasoning)
++
++        return tf.lookup.StaticHashTable(tf.lookup.KeyValueTensorInitializer(keys, values), default_value="")
++
++    reasoning_dataset = make_tf_dict(reasoning_dataset)
++
+     def restructure(traj):
+         # apply a standardization function, if provided
+         if standardize_fn is not None:
+@@ -179,11 +261,20 @@ def make_dataset_from_rlds(
+                 )
+             task["language_instruction"] = traj.pop(language_key)
+ 
++        file_name = traj["traj_metadata"]["episode_metadata"]["file_path"][0]
++        episode_id = traj["traj_metadata"]["episode_metadata"]["episode_id"][0]
++
++        file_names = tf.repeat(file_name, traj_len)
++        episode_ids = tf.as_string(tf.repeat(episode_id, traj_len))
++        indices = tf.as_string(tf.range(traj_len))
++        reasonings = reasoning_dataset.lookup(file_names + "_" + episode_ids + "_" + indices)
++
+         traj = {
+             "observation": new_obs,
+             "task": task,
+             "action": tf.cast(traj["action"], tf.float32),
+             "dataset_name": tf.repeat(name, traj_len),
++            "reasoning": reasonings,
+         }
+ 
+         if absolute_action_mask is not None:
+
+diff --git a/prismatic/vla/datasets/rlds/utils/data_utils.py b/prismatic/vla/datasets/rlds/utils/data_utils.py
+index 7b0e5ae..d42c5e0 100644
+--- a/prismatic/vla/datasets/rlds/utils/data_utils.py
++++ b/prismatic/vla/datasets/rlds/utils/data_utils.py
+@@ -277,18 +277,14 @@ def save_dataset_statistics(dataset_statistics, run_dir):
+     with open(out_path, "w") as f_json:
+         for _, stats in dataset_statistics.items():
+             for k in stats["action"].keys():
+-                if isinstance(stats["action"][k], np.ndarray):
+-                    stats["action"][k] = stats["action"][k].tolist()
++                stats["action"][k] = stats["action"][k].tolist()
+             if "proprio" in stats:
+                 for k in stats["proprio"].keys():
+-                    if isinstance(stats["proprio"][k], np.ndarray):
+-                        stats["proprio"][k] = stats["proprio"][k].tolist()
++                    stats["proprio"][k] = stats["proprio"][k].tolist()
+             if "num_trajectories" in stats:
+-                if isinstance(stats["num_trajectories"], np.ndarray):
+-                    stats["num_trajectories"] = stats["num_trajectories"].item()
++                stats["num_trajectories"] = stats["num_trajectories"].item()
+             if "num_transitions" in stats:
+-                if isinstance(stats["num_transitions"], np.ndarray):
+-                    stats["num_transitions"] = stats["num_transitions"].item()
++                stats["num_transitions"] = stats["num_transitions"].item()
+         json.dump(dataset_statistics, f_json, indent=2)
+     overwatch.info(f"Saved dataset statistics file at path {out_path}")
+ 
+
+diff --git a/vla-scripts/deploy.py b/vla-scripts/deploy.py
+index c70a9f2..8c3719c 100644
+--- a/vla-scripts/deploy.py
++++ b/vla-scripts/deploy.py
+@@ -92,7 +92,7 @@ class OpenVLAServer:
+         try:
+             if double_encode := "encoded" in payload:
+                 # Support cases where `json_numpy` is hard to install, and numpy arrays are "double-encoded" as strings
+-                assert len(payload.keys()) == 1, "Only uses encoded payload!"
++                assert len(payload.keys() == 1), "Only uses encoded payload!"
+                 payload = json.loads(payload["encoded"])
+ 
+             # Parse payload components
+diff --git a/vla-scripts/finetune.py b/vla-scripts/finetune.py
+index ec51a6b..6c50a6e 100644
+--- a/vla-scripts/finetune.py
++++ b/vla-scripts/finetune.py
+@@ -23,32 +23,26 @@ import os
+ from collections import deque
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Optional
+ 
+ import draccus
+ import torch
+ import torch.distributed as dist
+ import tqdm
++import wandb
+ from accelerate import PartialState
+ from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+ from torch.nn.parallel import DistributedDataParallel as DDP
+ from torch.optim import AdamW
+ from torch.utils.data import DataLoader
+ from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+-from transformers import AutoConfig, AutoImageProcessor
+ from transformers.modeling_outputs import CausalLMOutputWithPast
+ 
+-import wandb
+ from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
+ from prismatic.util.data_utils import PaddedCollatorForActionPrediction
+ from prismatic.vla.action_tokenizer import ActionTokenizer
+ from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
+ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+ 
+-from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+-
+ # Sane Defaults
+ os.environ["TOKENIZERS_PARALLELISM"] = "false"
+ 
+@@ -87,13 +81,10 @@ class FinetuneConfig:
+     batch_size: int = 16                                            # Fine-tuning batch size
+     max_steps: int = 200_000                                        # Max number of fine-tuning steps
+     save_steps: int = 5000                                          # Interval for checkpoint saving
+-    learning_rate: float = 5e-4                                     # Fine-tuning learning rate
++    learning_rate: float = 2e-5                                     # Fine-tuning learning rate
+     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
+     image_aug: bool = True                                          # Whether to train with image augmentations
+     shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
+-    save_latest_checkpoint_only: bool = True                        # Whether to save only one checkpoint per run and
+-                                                                    #   continually overwrite the latest checkpoint
+-                                                                    #   (If False, saves all checkpoints)
+ 
+     # LoRA Arguments
+     use_lora: bool = True                                           # Whether to use LoRA fine-tuning
+@@ -105,7 +96,6 @@ class FinetuneConfig:
+     # Tracking Parameters
+     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
+     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
+-    run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
+ 
+     # fmt: on
+ 
+@@ -130,10 +120,6 @@ def finetune(cfg: FinetuneConfig) -> None:
+         exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+     if cfg.use_quantization:
+         exp_id += "+q-4bit"
+-    if cfg.run_id_note is not None:
+-        exp_id += f"--{cfg.run_id_note}"
+-    if cfg.image_aug:
+-        exp_id += "--image_aug"
+ 
+     # Start =>> Build Directories
+     run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
+@@ -147,12 +133,6 @@ def finetune(cfg: FinetuneConfig) -> None:
+             load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_quant_type="nf4"
+         )
+ 
+-    # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
+-    AutoConfig.register("openvla", OpenVLAConfig)
+-    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+-    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+-    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+-
+     # Load OpenVLA Processor and Model using HF AutoClasses
+     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+     vla = AutoModelForVision2Seq.from_pretrained(
+@@ -341,33 +321,11 @@ def finetune(cfg: FinetuneConfig) -> None:
+                     merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
+                     merged_vla = merged_vla.merge_and_unload()
+                     if distributed_state.is_main_process:
+-                        if cfg.save_latest_checkpoint_only:
+-                            # Overwrite latest checkpoint
+-                            merged_vla.save_pretrained(run_dir)
+-
+-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
+-                        else:
+-                            # Prepare to save checkpoint in new directory
+-                            checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
+-                            os.makedirs(checkpoint_dir, exist_ok=True)
+-
+-                            # Save dataset statistics to new directory
+-                            save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
+-
+-                            # Save processor and model weights to new directory
+-                            processor.save_pretrained(checkpoint_dir)
+-                            merged_vla.save_pretrained(checkpoint_dir)
+-
+-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
++                        merged_vla.save_pretrained(run_dir)
+ 
+                 # Block on Main Process Checkpointing
+                 dist.barrier()
+ 
+-            # Stop training when max_steps is reached
+-            if gradient_step_idx == cfg.max_steps:
+-                print(f"Max step {cfg.max_steps} reached! Stopping training...")
+-                break
+-
+ 
+ if __name__ == "__main__":
+     finetune()

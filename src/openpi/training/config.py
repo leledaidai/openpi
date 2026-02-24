@@ -23,11 +23,14 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.bridge_rlds_dataset as bridge_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+
+import openpi.policies.bridge_policy as bridge_policy
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -97,6 +100,12 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # Chain-of-Thought (CoT) configuration
+    # Path to reasoning dataset JSON file (local path or HuggingFace repo)
+    reasoning_dataset_path: str | None = None
+    # Reasoning dropout probability for training robustness
+    reasoning_dropout_prob: float = 0.0
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -113,29 +122,39 @@ class ModelTransformFactory(GroupFactory):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
             case _model.ModelType.PI0:
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                        ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
-                    ],
-                )
+                transforms_list = [
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+                # Add CoT tokenization if enabled
+                if hasattr(model_config, 'use_cot') and model_config.use_cot:
+                    transforms_list.insert(-1, _transforms.TokenizeCoTReasoning(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        max_cot_tokens=model_config.max_cot_tokens,
+                    ))
+                return _transforms.Group(inputs=transforms_list)
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                            discrete_state_input=model_config.discrete_state_input,
-                        ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
-                    ],
-                )
+                transforms_list = [
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        discrete_state_input=model_config.discrete_state_input,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+                # Add CoT tokenization if enabled
+                if hasattr(model_config, 'use_cot') and model_config.use_cot:
+                    transforms_list.insert(-1, _transforms.TokenizeCoTReasoning(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        max_cot_tokens=model_config.max_cot_tokens,
+                    ))
+                return _transforms.Group(inputs=transforms_list)
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
@@ -145,14 +164,19 @@ class ModelTransformFactory(GroupFactory):
                 tokenizer_kwargs = (
                     {} if model_config.fast_model_tokenizer_kwargs is None else model_config.fast_model_tokenizer_kwargs
                 )
+                inputs_list = [
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizeFASTInputs(
+                        tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
+                    ),
+                ]
+                if hasattr(model_config, 'use_cot') and model_config.use_cot:
+                    # Insert PrepareCoTPrompt before TokenizeFASTInputs so that any
+                    # "reasoning" field in the data dict is moved to "cot_reasoning".
+                    inputs_list.insert(2, _transforms.PrepareCoTPrompt())
                 return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizeFASTInputs(
-                            tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
-                        ),
-                    ],
+                    inputs=inputs_list,
                     outputs=[
                         _transforms.ExtractFASTActions(
                             tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
@@ -424,6 +448,75 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class RLDSBridgeDataConfig(DataConfigFactory):
+    """
+    Config for training on Bridge dataset using RLDS data format with CoT reasoning support.
+    """
+
+    rlds_data_dir: str | None = None
+
+    # Path to reasoning dataset JSON file
+    reasoning_dataset_path: str | None = None
+
+    # Reasoning dropout probability
+    reasoning_dropout_prob: float = 0.0
+
+    # List of datasets to sample from: name, version, weight
+    datasets: Sequence[bridge_rlds_dataset.RLDSDataset] = (
+        bridge_rlds_dataset.RLDSDataset(
+            name="bridge_orig",
+            version="1.0.0",
+            weight=1.0,
+            filter_dict_path=None,
+        ),
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Bridge data repacking - adapt to your Bridge RLDS structure
+        # RepackTransform maps {new_key: old_key}
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/primary_image": "observation/image",  # new: old
+                        "observation/state": "observation/state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                        "cot_reasoning": "reasoning",  # Map reasoning to cot_reasoning for CoT training
+                    }
+                )
+            ]
+        )
+
+        # Use Bridge-specific transforms
+        data_transforms = _transforms.Group(
+            inputs=[
+                bridge_policy.BridgeInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                )
+            ],
+            outputs=[bridge_policy.BridgeOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        assert self.rlds_data_dir is not None, "Need to set rlds data dir for RLDS data loader."
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            rlds_data_dir=self.rlds_data_dir,
+            datasets=self.datasets,
+            reasoning_dataset_path=self.reasoning_dataset_path,
+            reasoning_dropout_prob=self.reasoning_dropout_prob,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotDROIDDataConfig(DataConfigFactory):
     """
     Example data config for custom DROID dataset in LeRobot format.
@@ -461,13 +554,66 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotBridgeDataConfig(DataConfigFactory):
+    use_quantile_norm: bool = True
+
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    prompt_from_task: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Make inputs look like they come from the Libero environment
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/primary_image": "observation.images.image_0",
+                        # "observation/left_yellow_image": "observation.images.image_1",
+                        # "observation/right_blue_image": "observation.images.image_2",
+                        # "observation/wirst_image": "observation.images.image_3",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Prepare data for policy training
+        # Convert images to uint8 numpy arrays, add masks
+        data_transforms = _transforms.Group(
+            inputs=[
+                bridge_policy.BridgeInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                )
+            ],
+            outputs=[bridge_policy.BridgeOutputs()],
+        )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=self.use_quantile_norm,
+            action_sequence_keys=self.action_sequence_keys,
+            prompt_from_task=self.prompt_from_task,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
     # Project name.
-    project_name: str = "openpi"
+    project_name: str = "openpi_cot"
     # Experiment name. Will be used to name the metadata and checkpoint directories.
     exp_name: str = tyro.MISSING
 
@@ -506,7 +652,7 @@ class TrainConfig:
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
-    num_workers: int = 2
+    num_workers: int = 8
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -758,7 +904,8 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        #pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        pytorch_weight_path="/inspire/hdd/global_user/gongjingjing-25039/zyfu/openpi/checkpoints/pi05_base_pt",
         num_train_steps=30_000,
     ),
     #
@@ -965,7 +1112,306 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
-    # RoboArena & PolaRiS configs.
+    TrainConfig(
+        name="pi0_fast_bridge_rlds_finetune_cot",
+
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=8,          # match your robot's action dimension
+            action_horizon=10,
+            max_token_len=1024,     # must be large enough: prefix + CoT + actions
+            use_cot=True,
+            max_cot_tokens=256,    # tune based on your reasoning length
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+            reasoning_dropout_prob=0.3,
+        ),
+
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        num_train_steps=30_000,
+        num_workers=0,  # required for RLDS data loader
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+    ),
+    TrainConfig(
+        name="pi05_bridge_lerobot_finetune",
+
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=True,    #default for pi05
+            # CoT disabled by default for backward compatibility
+            use_cot=False,
+        ),
+
+        data=LeRobotBridgeDataConfig(
+            repo_id="/inspire/hdd/global_user/gongjingjing-25039/zhdai/datasets/bridge_orig_lerobot",
+            base_config=DataConfig(
+                prompt_from_task=True
+            ),
+        ),
+
+        batch_size=64,
+
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+
+        num_train_steps=30_000,
+
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
+    ),
+    TrainConfig(
+        name="pi05_bridge_rlds_finetune_cot",
+
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=True,
+            max_token_len=512,  # Increased from default 200 to handle longer prompts
+            # Enable CoT
+            use_cot=True,
+            max_cot_tokens=512,
+            cot_loss_weight=1.0,
+            reasoning_dropout_prob=0.3,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+            reasoning_dropout_prob=0.3,
+        ),
+
+        batch_size=32,
+
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+
+        num_train_steps=30_000,
+
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
+    ),
+    # TrainConfig(
+    #     name="pi05_bridge_rlds_finetune_cot_weight_2",
+
+    #     model=pi0_config.Pi0Config(
+    #         pi05=True,
+    #         action_horizon=10,
+    #         discrete_state_input=True,
+    #         max_token_len=1024,  # Increased from default 200 to handle longer prompts
+    #         # Enable CoT
+    #         use_cot=True,
+    #         max_cot_tokens=1024,
+    #         cot_loss_weight=2.0,
+    #         reasoning_dropout_prob=0.3,
+    #     ),
+
+    #     data=RLDSBridgeDataConfig(
+    #         repo_id="bridge_orig",
+    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
+    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+    #         reasoning_dropout_prob=0.3,
+    #     ),
+
+    #     batch_size=32,
+
+    #     lr_schedule=_optimizer.CosineDecaySchedule(
+    #         warmup_steps=10_000,
+    #         peak_lr=5e-5,
+    #         decay_steps=1_000_000,
+    #         decay_lr=5e-5,
+    #     ),
+
+    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    #     ema_decay=0.999,
+
+    #     num_train_steps=30_000,
+
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
+    # ),
+    # TrainConfig(
+    #     name="pi05_bridge_rlds_finetune_cot_weight_05",
+
+    #     model=pi0_config.Pi0Config(
+    #         pi05=True,
+    #         action_horizon=10,
+    #         discrete_state_input=True,
+    #         max_token_len=1024,  # Increased from default 200 to handle longer prompts
+    #         # Enable CoT
+    #         use_cot=True,
+    #         max_cot_tokens=1024,
+    #         cot_loss_weight=0.5,
+    #         reasoning_dropout_prob=0.3,
+    #     ),
+
+    #     data=RLDSBridgeDataConfig(
+    #         repo_id="bridge_orig",
+    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
+    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+    #         reasoning_dropout_prob=0.3,
+    #     ),
+
+    #     batch_size=32,
+
+    #     lr_schedule=_optimizer.CosineDecaySchedule(
+    #         warmup_steps=10_000,
+    #         peak_lr=5e-5,
+    #         decay_steps=1_000_000,
+    #         decay_lr=5e-5,
+    #     ),
+
+    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    #     ema_decay=0.999,
+
+    #     num_train_steps=30_000,
+
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
+    # ),
+    # TrainConfig(
+    #     name="pi05_bridge_rlds_finetune_cot_weight_5",
+
+    #     model=pi0_config.Pi0Config(
+    #         pi05=True,
+    #         action_horizon=10,
+    #         discrete_state_input=True,
+    #         max_token_len=1024,  # Increased from default 200 to handle longer prompts
+    #         # Enable CoT
+    #         use_cot=True,
+    #         max_cot_tokens=1024,
+    #         cot_loss_weight=5.0,
+    #         reasoning_dropout_prob=0.3,
+    #     ),
+
+    #     data=RLDSBridgeDataConfig(
+    #         repo_id="bridge_orig",
+    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
+    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+    #         reasoning_dropout_prob=0.3,
+    #     ),
+
+    #     batch_size=32,
+
+    #     lr_schedule=_optimizer.CosineDecaySchedule(
+    #         warmup_steps=10_000,
+    #         peak_lr=5e-5,
+    #         decay_steps=1_000_000,
+    #         decay_lr=5e-5,
+    #     ),
+
+    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    #     ema_decay=0.999,
+
+    #     num_train_steps=30_000,
+
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
+    # ),
+    # TrainConfig(
+    #     name="pi05_bridge_rlds_finetune_cot_weight_01",
+
+    #     model=pi0_config.Pi0Config(
+    #         pi05=True,
+    #         action_horizon=10,
+    #         discrete_state_input=True,
+    #         max_token_len=1024,  # Increased from default 200 to handle longer prompts
+    #         # Enable CoT
+    #         use_cot=True,
+    #         max_cot_tokens=1024,
+    #         cot_loss_weight=0.1,
+    #         reasoning_dropout_prob=0.3,
+    #     ),
+
+    #     data=RLDSBridgeDataConfig(
+    #         repo_id="bridge_orig",
+    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
+    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+    #         reasoning_dropout_prob=0.3,
+    #     ),
+
+    #     batch_size=32,
+
+    #     lr_schedule=_optimizer.CosineDecaySchedule(
+    #         warmup_steps=10_000,
+    #         peak_lr=5e-5,
+    #         decay_steps=1_000_000,
+    #         decay_lr=5e-5,
+    #     ),
+
+    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    #     ema_decay=0.999,
+
+    #     num_train_steps=30_000,
+
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
+    # ),
+    TrainConfig(
+        name="pi05_bridge_rlds_finetune_cot_compute_norm_stats",
+
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=True,
+            max_token_len=1024,  # Increased from default 200 to handle longer prompts
+            # Enable CoT
+            use_cot=True,
+            max_cot_tokens=1024,
+            cot_loss_weight=1.0,
+            reasoning_dropout_prob=0.3,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+            reasoning_dropout_prob=0.3,
+        ),
+
+        batch_size=32,
+
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+
+        num_train_steps=30_000,
+
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
+    ),
+    
+    #
+    # RoboArena configs.
+    #
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]

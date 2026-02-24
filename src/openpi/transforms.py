@@ -260,10 +260,79 @@ class TokenizePrompt(DataTransformFn):
             state = None
 
         if not isinstance(prompt, str):
-            prompt = prompt.item()
+            # Handle numpy arrays/tensors with .item()
+            if hasattr(prompt, 'item'):
+                prompt = prompt.item()
+            # Handle bytes (from TensorFlow string tensors)
+            if isinstance(prompt, bytes):
+                prompt = prompt.decode('utf-8')
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeCoTReasoning(DataTransformFn):
+    """Tokenize CoT reasoning for training with teacher forcing."""
+
+    tokenizer: _tokenizer.PaligemmaTokenizer
+    max_cot_tokens: int = 1024
+
+    def __call__(self, data: DataDict) -> DataDict:
+        # Get reasoning and remove from dict (like TokenizePrompt does with prompt)
+        reasoning = data.pop("cot_reasoning", "")
+        if not isinstance(reasoning, str):
+            # Handle numpy arrays/tensors with .item()
+            if hasattr(reasoning, "item"):
+                reasoning = reasoning.item()
+            # Handle bytes (from TensorFlow string tensors)
+            if isinstance(reasoning, bytes):
+                reasoning = reasoning.decode('utf-8')
+            else:
+                reasoning = str(reasoning)
+
+        # If empty, return padded zero arrays
+        if not reasoning or len(reasoning.strip()) == 0:
+            # Create zero-padded arrays of fixed length
+            padded_tokens = np.zeros(self.max_cot_tokens, dtype=np.int32)
+            padded_masks = np.zeros(self.max_cot_tokens, dtype=np.bool_)
+            return {
+                **data,
+                "tokenized_cot_reasoning": padded_tokens,
+                "tokenized_cot_reasoning_mask": padded_masks,
+            }
+
+        # Add suffix to reasoning before tokenization.
+        # Strip the reasoning body first (mirrors tokenize()'s strip()), then append
+        # the suffix with its newline intact.
+        reasoning = reasoning.strip() + ';\nAction: '
+
+        # Encode WITHOUT BOS. CoT tokens are appended mid-sequence after the prefix,
+        # so BOS (token id=2) must not appear as a prediction target — it is a
+        # begin-of-sequence marker, not a continuable token.  We also bypass
+        # tokenize() entirely to preserve the '\n' in the suffix (tokenize() would
+        # replace it with a space via replace("\n", " ")).
+        token_ids = self.tokenizer._tokenizer.encode(reasoning, add_bos=False)
+        tokens = np.array(token_ids, dtype=np.int32)
+        token_masks = np.ones(len(tokens), dtype=np.bool_)
+
+        # Pad or truncate to max_cot_tokens
+        current_len = tokens.shape[0]
+        if current_len > self.max_cot_tokens:
+            # Truncate
+            tokens = tokens[: self.max_cot_tokens]
+            token_masks = token_masks[: self.max_cot_tokens]
+        elif current_len < self.max_cot_tokens:
+            # Pad with zeros
+            pad_len = self.max_cot_tokens - current_len
+            tokens = np.concatenate([tokens, np.zeros(pad_len, dtype=tokens.dtype)])
+            token_masks = np.concatenate([token_masks, np.zeros(pad_len, dtype=token_masks.dtype)])
+
+        return {
+            **data,
+            "tokenized_cot_reasoning": tokens,
+            "tokenized_cot_reasoning_mask": token_masks,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -275,10 +344,28 @@ class TokenizeFASTInputs(DataTransformFn):
             raise ValueError("Prompt is required")
 
         if not isinstance(prompt, str):
-            prompt = prompt.item()
+            # Handle numpy arrays/tensors with .item()
+            if hasattr(prompt, 'item'):
+                prompt = prompt.item()
+            # Handle bytes (from TensorFlow string tensors)
+            if isinstance(prompt, bytes):
+                prompt = prompt.decode('utf-8')
+
+        # Extract optional CoT reasoning and remove it from the data dict so it doesn't
+        # end up in the batch as a string array (JAX only accepts numeric arrays).
+        cot_reasoning = data.pop("cot_reasoning", None)
+        if cot_reasoning is not None and not isinstance(cot_reasoning, str):
+            if hasattr(cot_reasoning, 'item'):
+                cot_reasoning = cot_reasoning.item()
+            elif isinstance(cot_reasoning, bytes):
+                cot_reasoning = cot_reasoning.decode('utf-8')
+            else:
+                cot_reasoning = str(cot_reasoning)
 
         state, actions = data["state"], data.get("actions")
-        tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize(prompt, state, actions)
+        tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize(
+            prompt, state, actions, cot_reasoning=cot_reasoning
+        )
         return {
             **data,
             "tokenized_prompt": tokens,
@@ -334,6 +421,72 @@ class PadStatesAndActions(DataTransformFn):
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class ReasoningDropout(DataTransformFn):
+    """Randomly drops CoT reasoning sections during training for robustness.
+
+    This transform takes a reasoning string formatted as "TAG1: content1 TAG2: content2 ..."
+    and randomly drops sections with the given probability.
+    """
+
+    dropout_prob: float = 0.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "reasoning" not in data or self.dropout_prob == 0.0:
+            return data
+
+        reasoning = data["reasoning"]
+        if not isinstance(reasoning, str):
+            reasoning = reasoning.item() if hasattr(reasoning, "item") else str(reasoning)
+
+        if len(reasoning) == 0:
+            return data
+
+        # Import here to avoid circular dependency
+        from openpi.utils.cot_utils import abbreviate_tag, get_cot_tags_list
+
+        # Split reasoning by @ separator (internal format from data loading)
+        if "@" in reasoning:
+            reasoning_parts = reasoning.split("@")
+            tags = [(reasoning_parts[i], reasoning_parts[i + 1]) for i in range(0, len(reasoning_parts), 2) if i + 1 < len(reasoning_parts)]
+        else:
+            # Already formatted as "TAG: content TAG: content"
+            # Parse it back
+            from openpi.utils.cot_utils import parse_reasoning_string
+            parsed = parse_reasoning_string(reasoning)
+            tags = [(tag, content) for tag, content in parsed.items()]
+
+        # Randomly keep sections based on dropout probability
+        subset = np.random.rand(len(tags)) > self.dropout_prob
+
+        # Reconstruct reasoning string
+        filtered_reasoning = " ".join([f"{tag} {content}" for (tag, content), is_kept in zip(tags, subset) if is_kept])
+
+        data["reasoning"] = filtered_reasoning
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class PrepareCoTPrompt(DataTransformFn):
+    """Combines instruction and reasoning into the model input format.
+
+    This transform modifies the prompt to include CoT reasoning if available.
+    """
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "reasoning" not in data:
+            return data
+
+        reasoning = data.get("reasoning", "")
+        if not isinstance(reasoning, str):
+            reasoning = reasoning.item() if hasattr(reasoning, "item") else str(reasoning)
+
+        # Store reasoning separately for potential use in loss computation
+        data["cot_reasoning"] = reasoning
+
         return data
 
 

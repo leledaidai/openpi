@@ -1,0 +1,981 @@
+diff --git a/scripts/train.py b/scripts/train.py
+index 5d28941..6cbe389 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -188,6 +188,12 @@ def train_step(
+         "grad_norm": optax.global_norm(grads),
+         "param_norm": optax.global_norm(kernel_params),
+     }
++
++    # Add CoT-specific metrics if available
++    if hasattr(model, '_last_cot_loss') and hasattr(model, '_last_action_loss'):
++        info["cot_loss"] = model._last_cot_loss
++        info["action_loss"] = model._last_action_loss
++
+     return new_state, info
+ 
+ 
+diff --git a/src/openpi/models/model.py b/src/openpi/models/model.py
+index 29618b4..99e412c 100644
+--- a/src/openpi/models/model.py
++++ b/src/openpi/models/model.py
+@@ -99,6 +99,12 @@ class Observation(Generic[ArrayT]):
+     # Tokenized prompt mask.
+     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
+ 
++    # Chain-of-Thought (CoT) fields
++    # Tokenized CoT reasoning for training (teacher forcing)
++    tokenized_cot_reasoning: at.Int[ArrayT, "*b cot_l"] | None = None
++    # CoT reasoning mask
++    tokenized_cot_reasoning_mask: at.Bool[ArrayT, "*b cot_l"] | None = None
++
+     # pi0-fast model specific fields.
+ 
+     # Token auto-regressive mask (for FAST autoregressive model).
+@@ -124,6 +130,8 @@ class Observation(Generic[ArrayT]):
+             state=data["state"],
+             tokenized_prompt=data.get("tokenized_prompt"),
+             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
++            tokenized_cot_reasoning=data.get("tokenized_cot_reasoning"),
++            tokenized_cot_reasoning_mask=data.get("tokenized_cot_reasoning_mask"),
+             token_ar_mask=data.get("token_ar_mask"),
+             token_loss_mask=data.get("token_loss_mask"),
+         )
+@@ -203,6 +211,8 @@ def preprocess_observation(
+         state=observation.state,
+         tokenized_prompt=observation.tokenized_prompt,
+         tokenized_prompt_mask=observation.tokenized_prompt_mask,
++        tokenized_cot_reasoning=observation.tokenized_cot_reasoning,
++        tokenized_cot_reasoning_mask=observation.tokenized_cot_reasoning_mask,
+         token_ar_mask=observation.token_ar_mask,
+         token_loss_mask=observation.token_loss_mask,
+     )
+diff --git a/src/openpi/models/pi0.py b/src/openpi/models/pi0.py
+index ae7c459..88da67d 100644
+--- a/src/openpi/models/pi0.py
++++ b/src/openpi/models/pi0.py
+@@ -67,6 +67,10 @@ class Pi0(_model.BaseModel):
+     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
+         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+         self.pi05 = config.pi05
++        self.use_cot = config.use_cot
++        self.max_cot_tokens = config.max_cot_tokens
++        self.cot_loss_weight = config.cot_loss_weight
++
+         paligemma_config = _gemma.get_config(config.paligemma_variant)
+         action_expert_config = _gemma.get_config(config.action_expert_variant)
+         # TODO: rewrite gemma in NNX. For now, use bridge.
+@@ -185,6 +189,102 @@ class Pi0(_model.BaseModel):
+         ar_mask = jnp.array(ar_mask)
+         return tokens, input_mask, ar_mask, adarms_cond
+ 
++    @at.typecheck
++    def generate_cot_tokens(
++        self,
++        prefix_tokens: at.Float[at.Array, "b s emb"],
++        prefix_mask: at.Bool[at.Array, "b s"],
++        prefix_ar_mask: at.Bool[at.Array, " s"],
++        cot_target_tokens: at.Int[at.Array, "b cot_len"] | None = None,
++    ) -> tuple[
++        at.Float[at.Array, "b cot_len emb"],
++        at.Bool[at.Array, "b cot_len"],
++        at.Bool[at.Array, " cot_len"],
++        at.Int[at.Array, "b cot_len"] | None,
++    ]:
++        """Generate or embed Chain-of-Thought tokens.
++
++        During training (when cot_target_tokens is provided), this uses teacher forcing.
++        During inference (when cot_target_tokens is None), this generates tokens autoregressively.
++
++        Args:
++            prefix_tokens: Prefix embeddings (images + prompt)
++            prefix_mask: Prefix attention mask
++            prefix_ar_mask: Prefix autoregressive mask
++            cot_target_tokens: Ground truth CoT tokens for teacher forcing (training only)
++
++        Returns:
++            cot_embeddings: CoT token embeddings
++            cot_mask: CoT attention mask
++            cot_ar_mask: CoT autoregressive mask
++            cot_tokens: Generated token IDs (None during training with teacher forcing)
++        """
++        batch_size = prefix_tokens.shape[0]
++
++        if cot_target_tokens is not None:
++            # Training: use teacher forcing
++            cot_len = cot_target_tokens.shape[1]
++            cot_embeddings = self.PaliGemma.llm(cot_target_tokens, method="embed")
++            cot_mask = jnp.ones((batch_size, cot_len), dtype=jnp.bool_)
++            # CoT tokens attend to prefix but are causal among themselves
++            cot_ar_mask = jnp.array([False] + [True] * (cot_len - 1))
++            return cot_embeddings, cot_mask, cot_ar_mask, cot_target_tokens
++        else:
++            # Inference: autoregressive generation
++            # Start with BOS token (assuming token ID 1 is BOS)
++            current_tokens = jnp.ones((batch_size, 1), dtype=jnp.int32)
++            generated_tokens = []
++
++            for _ in range(self.max_cot_tokens):
++                # Embed current tokens
++                current_embeddings = self.PaliGemma.llm(current_tokens, method="embed")
++
++                # Create attention mask: prefix + generated tokens so far
++                seq_len = prefix_tokens.shape[1] + current_embeddings.shape[1]
++                combined_tokens = jnp.concatenate([prefix_tokens, current_embeddings], axis=1)
++                combined_mask = jnp.concatenate(
++                    [prefix_mask, jnp.ones((batch_size, current_embeddings.shape[1]), dtype=jnp.bool_)], axis=1
++                )
++                combined_ar_mask = jnp.concatenate(
++                    [prefix_ar_mask, jnp.array([False] + [True] * (current_embeddings.shape[1] - 1))], axis=0
++                )
++
++                attn_mask = make_attn_mask(combined_mask, combined_ar_mask)
++                positions = jnp.cumsum(combined_mask, axis=1) - 1
++
++                # Forward pass
++                output, _ = self.PaliGemma.llm(
++                    [combined_tokens, None], mask=attn_mask, positions=positions, adarms_cond=[None, None]
++                )
++
++                # Get logits for next token (last position)
++                next_token_logits = output[0][:, -1, :]  # [batch_size, vocab_size]
++
++                # Sample next token (greedy for now, could add temperature)
++                next_token = jnp.argmax(next_token_logits, axis=-1, keepdims=True)  # [batch_size, 1]
++
++                generated_tokens.append(next_token)
++
++                # Check for EOS token (assuming token ID 2 is EOS)
++                if jnp.all(next_token == 2):
++                    break
++
++                # Append to current tokens
++                current_tokens = jnp.concatenate([current_tokens, next_token], axis=1)
++
++            # Concatenate all generated tokens
++            if generated_tokens:
++                all_tokens = jnp.concatenate([jnp.ones((batch_size, 1), dtype=jnp.int32)] + generated_tokens, axis=1)
++            else:
++                all_tokens = jnp.ones((batch_size, 1), dtype=jnp.int32)
++
++            cot_len = all_tokens.shape[1]
++            cot_embeddings = self.PaliGemma.llm(all_tokens, method="embed")
++            cot_mask = jnp.ones((batch_size, cot_len), dtype=jnp.bool_)
++            cot_ar_mask = jnp.array([False] + [True] * (cot_len - 1))
++
++            return cot_embeddings, cot_mask, cot_ar_mask, all_tokens
++
+     @override
+     def compute_loss(
+         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+@@ -199,19 +299,89 @@ class Pi0(_model.BaseModel):
+         x_t = time_expanded * noise + (1 - time_expanded) * actions
+         u_t = noise - actions
+ 
+-        # one big forward pass of prefix + suffix at once
++        # Embed prefix (images + prompt)
+         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
++
++        cot_loss = 0.0
++        if self.use_cot and observation.tokenized_cot_reasoning is not None:
++            # Use teacher forcing with ground truth CoT tokens
++            cot_target_tokens = observation.tokenized_cot_reasoning
++            cot_embeddings, cot_mask, cot_ar_mask, _ = self.generate_cot_tokens(
++                prefix_tokens, prefix_mask, prefix_ar_mask, cot_target_tokens=cot_target_tokens
++            )
++
++            # Extend prefix with CoT for computing CoT loss
++            extended_prefix_tokens = jnp.concatenate([prefix_tokens, cot_embeddings], axis=1)
++            extended_prefix_mask = jnp.concatenate([prefix_mask, cot_mask], axis=1)
++            extended_prefix_ar_mask = jnp.concatenate([prefix_ar_mask, cot_ar_mask], axis=0)
++
++            # Forward pass through LLM to get CoT predictions
++            extended_attn_mask = make_attn_mask(extended_prefix_mask, extended_prefix_ar_mask)
++            extended_positions = jnp.cumsum(extended_prefix_mask, axis=1) - 1
++            (extended_out, _), _ = self.PaliGemma.llm(
++                [extended_prefix_tokens, None],
++                mask=extended_attn_mask,
++                positions=extended_positions,
++                adarms_cond=[None, None],
++            )
++
++            # Get logits for CoT tokens (skip the prefix part)
++            cot_logits = extended_out[:, prefix_tokens.shape[1] :, :]  # [batch, cot_len, vocab_size]
++
++            # Compute cross-entropy loss on CoT tokens
++            # Shift targets by 1 for next-token prediction
++            cot_targets = cot_target_tokens[:, 1:]  # [batch, cot_len-1]
++            cot_pred_logits = cot_logits[:, :-1, :]  # [batch, cot_len-1, vocab_size]
++
++            # Compute cross-entropy
++            log_probs = jax.nn.log_softmax(cot_pred_logits, axis=-1)
++            # Gather log probs for target tokens
++            batch_size, seq_len = cot_targets.shape
++            batch_indices = jnp.arange(batch_size)[:, None]
++            seq_indices = jnp.arange(seq_len)[None, :]
++            target_log_probs = log_probs[batch_indices, seq_indices, cot_targets]
++
++            # Mask out padding tokens (assuming 0 is padding)
++            cot_target_mask = cot_targets > 0
++            masked_log_probs = target_log_probs * cot_target_mask
++            cot_loss = -jnp.sum(masked_log_probs) / jnp.maximum(jnp.sum(cot_target_mask), 1.0)
++
++            # Use extended prefix (with CoT) for action generation
++            prefix_tokens = extended_prefix_tokens
++            prefix_mask = extended_prefix_mask
++            prefix_ar_mask = extended_prefix_ar_mask
++
++        # Embed suffix (state + noisy actions)
+         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
++
++        # Concatenate prefix (possibly with CoT) and suffix
+         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+         attn_mask = make_attn_mask(input_mask, ar_mask)
+         positions = jnp.cumsum(input_mask, axis=1) - 1
++
++        # Forward pass
+         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+         )
++
++        # Compute action loss
+         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++        action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
++
++        # Combine losses
++        if self.use_cot and observation.tokenized_cot_reasoning is not None:
++            total_loss = action_loss + self.cot_loss_weight * cot_loss
++            # Store individual losses as attributes for metrics tracking
++            # This is a workaround since we can't return a dict without changing the interface
++            self._last_cot_loss = cot_loss
++            self._last_action_loss = jnp.mean(action_loss)
++        else:
++            total_loss = action_loss
++            self._last_cot_loss = 0.0
++            self._last_action_loss = jnp.mean(action_loss)
+ 
+-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
++        return total_loss
+ 
+     @override
+     def sample_actions(
+@@ -230,8 +400,19 @@ class Pi0(_model.BaseModel):
+         if noise is None:
+             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+ 
+-        # first fill KV cache with a forward pass of the prefix
++        # First fill KV cache with a forward pass of the prefix
+         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
++
++        # Generate CoT tokens if enabled
++        if self.use_cot:
++            cot_embeddings, cot_mask, cot_ar_mask, cot_tokens = self.generate_cot_tokens(
++                prefix_tokens, prefix_mask, prefix_ar_mask, cot_target_tokens=None
++            )
++            # Extend prefix with CoT embeddings
++            prefix_tokens = jnp.concatenate([prefix_tokens, cot_embeddings], axis=1)
++            prefix_mask = jnp.concatenate([prefix_mask, cot_mask], axis=1)
++            prefix_ar_mask = jnp.concatenate([prefix_ar_mask, cot_ar_mask], axis=0)
++
+         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+         positions = jnp.cumsum(prefix_mask, axis=1) - 1
+         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+diff --git a/src/openpi/models/pi0_config.py b/src/openpi/models/pi0_config.py
+index b0f6b66..c406384 100644
+--- a/src/openpi/models/pi0_config.py
++++ b/src/openpi/models/pi0_config.py
+@@ -32,6 +32,12 @@ class Pi0Config(_model.BaseModelConfig):
+     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
+     discrete_state_input: bool = None  # type: ignore
+ 
++    # Chain-of-Thought (CoT) configuration
++    use_cot: bool = False  # Enable/disable CoT reasoning
++    max_cot_tokens: int = 256  # Maximum CoT sequence length
++    cot_loss_weight: float = 1.0  # Weight for CoT loss relative to action loss
++    reasoning_dropout_prob: float = 0.0  # Dropout probability for CoT during training
++
+     def __post_init__(self):
+         if self.max_token_len is None:
+             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+diff --git a/src/openpi/policies/policy.py b/src/openpi/policies/policy.py
+index b9b708b..0a29f2c 100644
+--- a/src/openpi/policies/policy.py
++++ b/src/openpi/policies/policy.py
+@@ -94,6 +94,15 @@ class Policy(BasePolicy):
+             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+         }
+         model_time = time.monotonic() - start_time
++
++        # Add CoT information if available (for debugging/visualization)
++        if hasattr(self._model, "use_cot") and self._model.use_cot:
++            # CoT tokens are generated internally in sample_actions
++            # We could optionally decode and return them here for visualization
++            outputs["cot_enabled"] = True
++        else:
++            outputs["cot_enabled"] = False
++
+         if self._is_pytorch_model:
+             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+         else:
+diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
+index 4ca47e1..10599ee 100644
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -29,6 +29,8 @@ import openpi.training.optimizer as _optimizer
+ import openpi.training.weight_loaders as weight_loaders
+ import openpi.transforms as _transforms
+ 
++import openpi.policies.bridge_policy as bridge_policy
++
+ ModelType: TypeAlias = _model.ModelType
+ # Work around a tyro issue with using nnx.filterlib.Filter directly.
+ Filter: TypeAlias = nnx.filterlib.Filter
+@@ -97,6 +99,12 @@ class DataConfig:
+     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
+     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+ 
++    # Chain-of-Thought (CoT) configuration
++    # Path to reasoning dataset JSON file (local path or HuggingFace repo)
++    reasoning_dataset_path: str | None = None
++    # Reasoning dropout probability for training robustness
++    reasoning_dropout_prob: float = 0.0
++
+ 
+ class GroupFactory(Protocol):
+     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+@@ -113,29 +121,39 @@ class ModelTransformFactory(GroupFactory):
+     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+         match model_config.model_type:
+             case _model.ModelType.PI0:
+-                return _transforms.Group(
+-                    inputs=[
+-                        _transforms.InjectDefaultPrompt(self.default_prompt),
+-                        _transforms.ResizeImages(224, 224),
+-                        _transforms.TokenizePrompt(
+-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+-                        ),
+-                        _transforms.PadStatesAndActions(model_config.action_dim),
+-                    ],
+-                )
++                transforms_list = [
++                    _transforms.InjectDefaultPrompt(self.default_prompt),
++                    _transforms.ResizeImages(224, 224),
++                    _transforms.TokenizePrompt(
++                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
++                    ),
++                    _transforms.PadStatesAndActions(model_config.action_dim),
++                ]
++                # Add CoT tokenization if enabled
++                if hasattr(model_config, 'use_cot') and model_config.use_cot:
++                    transforms_list.insert(-1, _transforms.TokenizeCoTReasoning(
++                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
++                        max_cot_tokens=model_config.max_cot_tokens,
++                    ))
++                return _transforms.Group(inputs=transforms_list)
+             case _model.ModelType.PI05:
+                 assert isinstance(model_config, pi0_config.Pi0Config)
+-                return _transforms.Group(
+-                    inputs=[
+-                        _transforms.InjectDefaultPrompt(self.default_prompt),
+-                        _transforms.ResizeImages(224, 224),
+-                        _transforms.TokenizePrompt(
+-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+-                            discrete_state_input=model_config.discrete_state_input,
+-                        ),
+-                        _transforms.PadStatesAndActions(model_config.action_dim),
+-                    ],
+-                )
++                transforms_list = [
++                    _transforms.InjectDefaultPrompt(self.default_prompt),
++                    _transforms.ResizeImages(224, 224),
++                    _transforms.TokenizePrompt(
++                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
++                        discrete_state_input=model_config.discrete_state_input,
++                    ),
++                    _transforms.PadStatesAndActions(model_config.action_dim),
++                ]
++                # Add CoT tokenization if enabled
++                if hasattr(model_config, 'use_cot') and model_config.use_cot:
++                    transforms_list.insert(-1, _transforms.TokenizeCoTReasoning(
++                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
++                        max_cot_tokens=model_config.max_cot_tokens,
++                    ))
++                return _transforms.Group(inputs=transforms_list)
+             case _model.ModelType.PI0_FAST:
+                 tokenizer_cls = (
+                     _tokenizer.FASTTokenizer
+@@ -461,6 +479,59 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
+             model_transforms=model_transforms,
+         )
+ 
++@dataclasses.dataclass(frozen=True)
++class LeRobotBridgeDataConfig(DataConfigFactory):
++    use_quantile_norm: bool = True
++
++    # Action keys that will be used to read the action sequence from the dataset.
++    action_sequence_keys: Sequence[str] = ("action",)
++
++    prompt_from_task: bool = True
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        # Make inputs look like they come from the Libero environment
++        repack_transform = _transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "observation/primary_image": "observation.images.image_0",
++                        # "observation/left_yellow_image": "observation.images.image_1",
++                        # "observation/right_blue_image": "observation.images.image_2",
++                        # "observation/wirst_image": "observation.images.image_3",
++                        "observation/state": "observation.state",
++                        "actions": "action",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++
++        # Prepare data for policy training
++        # Convert images to uint8 numpy arrays, add masks
++        data_transforms = _transforms.Group(
++            inputs=[
++                bridge_policy.BridgeInputs(
++                    action_dim=model_config.action_dim,
++                    model_type=model_config.model_type,
++                )
++            ],
++            outputs=[bridge_policy.BridgeOutputs()],
++        )
++
++        # Model transforms include things like tokenizing the prompt and action targets
++        model_transforms = ModelTransformFactory()(model_config)
++
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=repack_transform,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            use_quantile_norm=self.use_quantile_norm,
++            action_sequence_keys=self.action_sequence_keys,
++            prompt_from_task=self.prompt_from_task,
++        )
++
+ 
+ @dataclasses.dataclass(frozen=True)
+ class TrainConfig:
+@@ -506,7 +577,7 @@ class TrainConfig:
+     batch_size: int = 32
+     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
+     # will increase memory and CPU usage.
+-    num_workers: int = 2
++    num_workers: int = 8
+     # Number of train steps (batches) to run.
+     num_train_steps: int = 30_000
+ 
+@@ -758,7 +829,8 @@ _CONFIGS = [
+         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+         ema_decay=0.999,
+         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
++        #pytorch_weight_path="/path/to/your/pytorch_weight_path",
++        pytorch_weight_path="/inspire/hdd/global_user/gongjingjing-25039/zyfu/openpi/checkpoints/pi05_base_pt",
+         num_train_steps=30_000,
+     ),
+     #
+@@ -965,7 +1037,200 @@ _CONFIGS = [
+         exp_name="debug_pi05",
+         wandb_enabled=False,
+     ),
+-    # RoboArena & PolaRiS configs.
++    TrainConfig(
++        name="pi05_bridge_lerobot_finetune",
++
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++        ),
++
++        data=LeRobotBridgeDataConfig(
++            repo_id="/inspire/hdd/global_user/gongjingjing-25039/zhdai/datasets/bridge_orig_lerobot",
++            base_config=DataConfig(
++                prompt_from_task=True
++            ),
++        ),
++
++        batch_size=64,
++
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=10_000,
++            peak_lr=5e-5,
++            decay_steps=1_000_000,
++            decay_lr=5e-5,
++        ),
++
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        ema_decay=0.999,
++
++        num_train_steps=30_000,
++
++        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
++    ),
++    # TrainConfig(
++    #     # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.
++    #     # Here, we use LeRobot data format (like for all other fine-tuning examples)
++    #     # To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
++    #     name="pi05_bridge_lerobot_finetune_zihao",
++    #     model=pi0_config.Pi0Config(
++    #         pi05=True,
++    #         action_dim=32,  # pi05 is trained with 32-dim actions
++    #         action_horizon=10,
++    #     ),
++    #     data=LeRobotDROIDDataConfig(
++    #         # Replace with your custom DROID LeRobot dataset repo id.
++    #         repo_id="/inspire/hdd/global_user/gongjingjing-25039/zyfu/datasets/bridge_orig_lerobot",
++    #         base_config=DataConfig(prompt_from_task=True),
++    #         # assets=AssetsConfig(
++    #         #     # Important: reuse the original DROID norm stats during fine-tuning!
++    #         #     assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
++    #         #     asset_id="droid",
++    #         # ),
++    #     ),
++    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
++    #     num_train_steps=20_000,
++    #     batch_size=32,
++    # ),
++    # TrainConfig(
++    #     name="pi05_bridge_lerobot_finetune",
++
++    #     model=pi0_config.Pi0Config(
++    #         pi05=True,
++    #         action_dim=32
++    #         action_horizon=16,#?
++    #     ),
++
++    #     data=LeRobotBridgeDataConfig(
++    #         repo_id="/inspire/hdd/global_user/gongjingjing-25039/zyfu/datasets/bridge_orig_lerobot",
++    #         base_config=DataConfig(prompt_from_task=True),
++    #         assets=AssetsConfig(
++    #             # Important: reuse the original DROID norm stats during fine-tuning!
++    #             assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
++    #             asset_id="droid",
++    #         ),
++    #     ),
++    #     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
++    #     num_train_steps=20_000,
++    #     batch_size=128,
++
++    #     lr_schedule=_optimizer.CosineDecaySchedule(
++    #         warmup_steps=10_000,
++    #         peak_lr=5e-5,
++    #         decay_steps=1_000_000,
++    #         decay_lr=5e-5,
++    #     ),
++
++        # optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        # ema_decay=0.999,
++
++        # num_train_steps=30_000,
++
++        # weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zyfu/model_ckpt/pi05_base_JAX/params"),
++    # ),
++    # TrainConfig(
++    #     name="pi05_bridge_lerobot_finetune",
++
++    #     model=pi0_config.Pi0Config(
++    #         pi05=True,
++    #         action_horizon=10,
++    #         discrete_state_input=False,
++    #     ),
++
++    #     data=LeRobotBridgeDataConfig(
++    #         repo_id="/inspire/hdd/global_user/gongjingjing-25039/zyfu/datasets/bridge_orig_lerobot",
++    #         base_config=DataConfig(
++    #             prompt_from_task=True
++    #         ),
++    #     ),
++
++    #     batch_size=128,
++
++    #     lr_schedule=_optimizer.CosineDecaySchedule(
++    #         warmup_steps=10_000,
++    #         peak_lr=5e-5,
++    #         decay_steps=1_000_000,
++    #         decay_lr=5e-5,
++    #     ),
++
++    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++    #     ema_decay=0.999,
++
++    #     num_train_steps=30_000,
++
++    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zyfu/model_ckpt/pi05_base_JAX/params"),
++    # ),
++    
++    # TrainConfig(
++    #     name="LIME_pi0_bridge_lerobot",
++
++    #     model=pi0_config.Pi0Config(
++    #         action_horizon=10,
++    #         discrete_state_input=False,
++    #     ),
++
++    #     data=LeRobotBridgeDataConfig(
++    #         repo_id="/inspire/hdd/global_user/gongjingjing-25039/zyfu/datasets/bridge_orig_lerobot",
++    #         base_config=DataConfig(
++    #             prompt_from_task=True
++    #         ),
++    #     ),
++
++    #     batch_size=128,
++
++    #     lr_schedule=_optimizer.CosineDecaySchedule(
++    #         warmup_steps=10_000,
++    #         peak_lr=5e-5,
++    #         decay_steps=1_000_000,
++    #         decay_lr=5e-5,
++    #     ),
++
++    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++    #     ema_decay=0.999,
++
++    #     num_train_steps=30_000,
++
++    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zyfu/model_ckpt/pi0_base_JAX/params"),
++    # ),
++    
++    # TrainConfig(
++    #     name="LIME_pi_fast_bridge_lerobot",
++        
++    #     model=pi0_fast.Pi0FASTConfig(
++    #         action_dim=7,
++    #         action_horizon=10,
++    #         max_token_len=100,
++    #     ),
++
++    #     data=LeRobotBridgeDataConfig(
++    #         repo_id="/inspire/hdd/global_user/gongjingjing-25039/zyfu/datasets/bridge_orig_lerobot",
++    #         base_config=DataConfig(
++    #             prompt_from_task=True
++    #         ),
++    #     ),
++
++    #     batch_size=128,
++
++    #     lr_schedule=_optimizer.CosineDecaySchedule(
++    #         warmup_steps=10_000,
++    #         peak_lr=5e-5,
++    #         decay_steps=1_000_000,
++    #         decay_lr=5e-5,
++    #     ),
++
++    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++    #     ema_decay=0.999,
++
++    #     num_train_steps=50_000,
++
++    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zyfu/model_ckpt/pi0_fast_base_JAX/params"),
++    #     # weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zyfu/model_ckpt/LIME/LIME_pi_fast_bridge_lerobot_distributed/29999/params"),
++    # ),
++
++    #
++    # RoboArena configs.
++    #
+     *roboarena_config.get_roboarena_configs(),
+     *polaris_config.get_polaris_configs(),
+ ]
+diff --git a/src/openpi/training/data_loader.py b/src/openpi/training/data_loader.py
+index e2ee7dd..1cd03ae 100644
+--- a/src/openpi/training/data_loader.py
++++ b/src/openpi/training/data_loader.py
+@@ -166,6 +166,7 @@ def create_rlds_dataset(
+         action_chunk_size=action_horizon,
+         action_space=data_config.action_space,
+         datasets=data_config.datasets,
++        reasoning_dataset_path=data_config.reasoning_dataset_path,
+     )
+ 
+ 
+diff --git a/src/openpi/training/droid_rlds_dataset.py b/src/openpi/training/droid_rlds_dataset.py
+index 2cb08a1..65461fd 100644
+--- a/src/openpi/training/droid_rlds_dataset.py
++++ b/src/openpi/training/droid_rlds_dataset.py
+@@ -49,6 +49,7 @@ class DroidRldsDataset:
+         shuffle_buffer_size: int = 250_000,
+         num_parallel_reads: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
+         num_parallel_calls: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
++        reasoning_dataset_path: str | None = None,  # Path to reasoning JSON file
+     ):
+         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
+         import dlimp as dl
+@@ -61,6 +62,11 @@ class DroidRldsDataset:
+         # Ensure dataset weights sum to 1.0
+         assert sum(dataset.weight for dataset in datasets) == 1.0, "Dataset weights must sum to 1.0"
+ 
++        # Load reasoning dataset if provided
++        reasoning_table = None
++        if reasoning_dataset_path is not None:
++            reasoning_table = self._load_reasoning_dataset(reasoning_dataset_path)
++
+         def prepare_single_dataset(dataset_cfg: RLDSDataset):
+             # ds_name, version = dataset_name.split(":")
+             ds_name, version = dataset_cfg.name, dataset_cfg.version
+@@ -155,6 +161,14 @@ class DroidRldsDataset:
+                 )
+                 passes_filter = self.filter_table.lookup(step_id)
+ 
++                # Lookup reasoning if available
++                reasoning = ""
++                if reasoning_table is not None:
++                    file_path = traj["traj_metadata"]["episode_metadata"]["file_path"][0]
++                    episode_id = tf.as_string(traj["traj_metadata"]["episode_metadata"]["episode_id"][0])
++                    reasoning_keys = file_path + "_" + episode_id + "_" + indices
++                    reasoning = reasoning_table.lookup(reasoning_keys)
++
+                 return {
+                     "actions": actions,
+                     "observation": {
+@@ -166,6 +180,7 @@ class DroidRldsDataset:
+                     "prompt": instruction,
+                     "step_id": step_id,
+                     "passes_filter": passes_filter,
++                    "reasoning": reasoning,
+                 }
+ 
+             dataset = dataset.traj_map(restructure, num_parallel_calls)
+@@ -246,3 +261,113 @@ class DroidRldsDataset:
+         # This is the approximate number of samples in DROID after filtering.
+         # Easier to hardcode than to iterate through the dataset and compute it.
+         return 20_000_000
++
++    def _load_reasoning_dataset(self, reasoning_dataset_path: str):
++        """Load reasoning dataset from JSON file and create TensorFlow lookup table.
++
++        Args:
++            reasoning_dataset_path: Path to reasoning JSON file (local or HuggingFace)
++
++        Returns:
++            TensorFlow StaticHashTable mapping frame keys to reasoning strings
++        """
++        import tensorflow as tf
++
++        # Download if needed
++        if reasoning_dataset_path.startswith("http") or "::" in reasoning_dataset_path:
++            cached_path = download.maybe_download(reasoning_dataset_path)
++        else:
++            cached_path = reasoning_dataset_path
++
++        # Check if file exists
++        if not Path(cached_path).exists():
++            logging.warning(f"Reasoning dataset not found at {cached_path}, using empty reasoning")
++            return tf.lookup.StaticHashTable(
++                tf.lookup.KeyValueTensorInitializer([""], [""]), default_value=""
++            )
++
++        logging.info(f"Loading reasoning dataset from {cached_path}")
++        with Path(cached_path).open("r") as f:
++            reasoning_dataset = json.load(f)
++
++        # Import CoT utilities
++        from openpi.utils.cot_utils import format_reasoning_dict_to_string, get_cot_database_keys
++
++        # Build lookup table
++        keys = []
++        values = []
++        has_reasoning = [0, 0]  # [count without reasoning, count with reasoning]
++
++        logging.info("Building reasoning lookup table...")
++        for file_name in tqdm.tqdm(reasoning_dataset.keys(), desc="Processing reasoning data"):
++            for episode_id in reasoning_dataset[file_name].keys():
++                episode_data = reasoning_dataset[file_name][episode_id]
++
++                if "reasoning" not in episode_data:
++                    has_reasoning[0] += 1
++                    continue
++
++                has_reasoning[1] += 1
++
++                for frame_idx in episode_data["reasoning"].keys():
++                    reasoning_dict = episode_data["reasoning"][frame_idx]
++
++                    # Add gripper position if available
++                    if "features" in episode_data and "gripper_position" in episode_data["features"]:
++                        gripper_positions = episode_data["features"]["gripper_position"]
++                        if gripper_positions is not None and int(frame_idx) < len(gripper_positions):
++                            # Look ahead a few frames for gripper trajectory
++                            gripper_lookahead = 5
++                            future_positions = []
++                            for j in range(gripper_lookahead):
++                                if int(frame_idx) + j < len(gripper_positions):
++                                    future_positions.extend(gripper_positions[int(frame_idx) + j])
++                                else:
++                                    # Repeat last position
++                                    future_positions.extend(future_positions[-2:] if future_positions else [0, 0])
++                            reasoning_dict["gripper"] = str(future_positions)
++                        else:
++                            reasoning_dict["gripper"] = ""
++                    else:
++                        reasoning_dict["gripper"] = ""
++
++                    # Add bounding boxes if available
++                    if "features" in episode_data and "bboxes" in episode_data["features"]:
++                        bboxes = episode_data["features"]["bboxes"]
++                        if bboxes is not None and int(frame_idx) < len(bboxes):
++                            if len(bboxes[int(frame_idx)]) > 0:
++                                boxes_list = bboxes[int(frame_idx)]
++                                reasoning_dict["bboxes"] = ", ".join(
++                                    [f"{name} {box}" for prob, name, box in boxes_list]
++                                )
++                            else:
++                                reasoning_dict["bboxes"] = ""
++                        else:
++                            reasoning_dict["bboxes"] = ""
++                    else:
++                        reasoning_dict["bboxes"] = ""
++
++                    # Format reasoning dict to string
++                    reasoning_str = format_reasoning_dict_to_string(reasoning_dict)
++
++                    # Create key: file_name_episode_id_frame_idx
++                    key = f"{file_name}_{episode_id}_{frame_idx}"
++                    keys.append(key)
++                    values.append(reasoning_str)
++
++        logging.info(f"Reasoning lookup table built with {len(keys)} entries")
++        logging.info(f"Reasoning presence statistics [# without, # with]: {has_reasoning}")
++        if keys:
++            logging.info(f"Example reasoning key: {keys[0]}")
++            logging.info(f"Example reasoning value: {values[0][:200]}...")
++
++        # Create TensorFlow lookup table
++        if not keys:
++            logging.warning("No reasoning data found, using empty table")
++            return tf.lookup.StaticHashTable(
++                tf.lookup.KeyValueTensorInitializer([""], [""]), default_value=""
++            )
++
++        return tf.lookup.StaticHashTable(
++            tf.lookup.KeyValueTensorInitializer(keys, values), default_value=""
++        )
+diff --git a/src/openpi/transforms.py b/src/openpi/transforms.py
+index 272375e..63837ba 100644
+--- a/src/openpi/transforms.py
++++ b/src/openpi/transforms.py
+@@ -266,6 +266,42 @@ class TokenizePrompt(DataTransformFn):
+         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+ 
+ 
++@dataclasses.dataclass(frozen=True)
++class TokenizeCoTReasoning(DataTransformFn):
++    """Tokenize CoT reasoning for training with teacher forcing."""
++
++    tokenizer: _tokenizer.PaligemmaTokenizer
++    max_cot_tokens: int = 256
++
++    def __call__(self, data: DataDict) -> DataDict:
++        # Only tokenize if reasoning is present
++        if "cot_reasoning" not in data:
++            return data
++
++        reasoning = data.get("cot_reasoning", "")
++        if not isinstance(reasoning, str):
++            reasoning = reasoning.item() if hasattr(reasoning, "item") else str(reasoning)
++
++        # Skip if empty
++        if not reasoning or len(reasoning.strip()) == 0:
++            return data
++
++        # Tokenize the reasoning string
++        # Note: We use the same tokenizer as for prompts
++        tokens, token_masks = self.tokenizer.tokenize(reasoning, None)
++
++        # Truncate to max_cot_tokens if needed
++        if tokens.shape[0] > self.max_cot_tokens:
++            tokens = tokens[: self.max_cot_tokens]
++            token_masks = token_masks[: self.max_cot_tokens]
++
++        return {
++            **data,
++            "tokenized_cot_reasoning": tokens,
++            "tokenized_cot_reasoning_mask": token_masks,
++        }
++
++
+ @dataclasses.dataclass(frozen=True)
+ class TokenizeFASTInputs(DataTransformFn):
+     tokenizer: _tokenizer.FASTTokenizer
+@@ -337,6 +373,72 @@ class PadStatesAndActions(DataTransformFn):
+         return data
+ 
+ 
++@dataclasses.dataclass(frozen=True)
++class ReasoningDropout(DataTransformFn):
++    """Randomly drops CoT reasoning sections during training for robustness.
++
++    This transform takes a reasoning string formatted as "TAG1: content1 TAG2: content2 ..."
++    and randomly drops sections with the given probability.
++    """
++
++    dropout_prob: float = 0.0
++
++    def __call__(self, data: DataDict) -> DataDict:
++        if "reasoning" not in data or self.dropout_prob == 0.0:
++            return data
++
++        reasoning = data["reasoning"]
++        if not isinstance(reasoning, str):
++            reasoning = reasoning.item() if hasattr(reasoning, "item") else str(reasoning)
++
++        if len(reasoning) == 0:
++            return data
++
++        # Import here to avoid circular dependency
++        from openpi.utils.cot_utils import abbreviate_tag, get_cot_tags_list
++
++        # Split reasoning by @ separator (internal format from data loading)
++        if "@" in reasoning:
++            reasoning_parts = reasoning.split("@")
++            tags = [(reasoning_parts[i], reasoning_parts[i + 1]) for i in range(0, len(reasoning_parts), 2) if i + 1 < len(reasoning_parts)]
++        else:
++            # Already formatted as "TAG: content TAG: content"
++            # Parse it back
++            from openpi.utils.cot_utils import parse_reasoning_string
++            parsed = parse_reasoning_string(reasoning)
++            tags = [(tag, content) for tag, content in parsed.items()]
++
++        # Randomly keep sections based on dropout probability
++        subset = np.random.rand(len(tags)) > self.dropout_prob
++
++        # Reconstruct reasoning string
++        filtered_reasoning = " ".join([f"{tag} {content}" for (tag, content), is_kept in zip(tags, subset) if is_kept])
++
++        data["reasoning"] = filtered_reasoning
++        return data
++
++
++@dataclasses.dataclass(frozen=True)
++class PrepareCoTPrompt(DataTransformFn):
++    """Combines instruction and reasoning into the model input format.
++
++    This transform modifies the prompt to include CoT reasoning if available.
++    """
++
++    def __call__(self, data: DataDict) -> DataDict:
++        if "reasoning" not in data:
++            return data
++
++        reasoning = data.get("reasoning", "")
++        if not isinstance(reasoning, str):
++            reasoning = reasoning.item() if hasattr(reasoning, "item") else str(reasoning)
++
++        # Store reasoning separately for potential use in loss computation
++        data["cot_reasoning"] = reasoning
++
++        return data
++
++
+ def flatten_dict(tree: at.PyTree) -> dict:
+     """Flatten a nested dictionary. Uses '/' as the separator."""
+     return traverse_util.flatten_dict(tree, sep="/")

@@ -147,15 +147,22 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        result = model.compute_loss(rng, observation, actions, train=True)
+        # Handle both old API (returns Array) and new API (returns tuple[Array, dict])
+        if isinstance(result, tuple):
+            chunked_loss, aux = result
+            return jnp.mean(chunked_loss), aux
+        else:
+            # Old API, no auxiliary output
+            chunked_loss = result
+            return jnp.mean(chunked_loss), {}
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True, argnums=diff_state)(model, train_rng, observation, actions)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -188,6 +195,13 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+
+    # Add CoT-specific metrics from auxiliary output
+    if 'cot_loss' in aux:
+        info["cot_loss"] = aux['cot_loss']
+    if 'action_loss' in aux:
+        info["action_loss"] = aux['action_loss']
+
     return new_state, info
 
 
@@ -263,7 +277,14 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            # Format values: use .4f for numbers, str() for others
+            info_parts = []
+            for k, v in reduced_info.items():
+                if isinstance(v, (int, float, np.number)):
+                    info_parts.append(f"{k}={v:.4f}")
+                else:
+                    info_parts.append(f"{k}={v}")
+            info_str = ", ".join(info_parts)
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []

@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.bridge_rlds_dataset import BridgeRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -157,16 +158,27 @@ def create_rlds_dataset(
     batch_size: int,
     *,
     shuffle: bool = False,
+    load_reasoning: bool = True,  # Set False when computing norm stats
 ) -> Dataset:
-    # At the moment, we only support DROID for RLDS datasets.
-    return DroidRldsDataset(
-        data_dir=data_config.rlds_data_dir,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        action_chunk_size=action_horizon,
-        action_space=data_config.action_space,
-        datasets=data_config.datasets,
-    )
+    # Support both DROID and Bridge RLDS datasets
+    kwargs = {
+        "data_dir": data_config.rlds_data_dir,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "action_chunk_size": action_horizon,
+        "datasets": data_config.datasets,
+        "reasoning_dataset_path": data_config.reasoning_dataset_path,
+        "load_reasoning": load_reasoning,  # Pass through to dataset
+    }
+
+    # Check if this is a Bridge dataset config (no action_space) or DROID (has action_space)
+    if hasattr(data_config, 'action_space') and data_config.action_space is not None:
+        # DROID dataset
+        kwargs["action_space"] = data_config.action_space
+        return DroidRldsDataset(**kwargs)
+    else:
+        # Bridge dataset
+        return BridgeRldsDataset(**kwargs)
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:

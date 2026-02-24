@@ -25,7 +25,8 @@ class PaligemmaTokenizer:
             # This is the Pi05 format, where the state is part of the discrete language input.
             discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
             state_str = " ".join(map(str, discretized_state))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            # full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};"
             tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         else:
             # This is the Pi0 format, where the state is part of the continuous action expert input.
@@ -62,7 +63,8 @@ class FASTTokenizer:
         self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
 
     def tokenize(
-        self, prompt: str, state: np.ndarray, actions: np.ndarray | None
+        self, prompt: str, state: np.ndarray, actions: np.ndarray | None,
+        cot_reasoning: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         cleaned_text = prompt.lower().strip().replace("_", " ")
 
@@ -73,6 +75,13 @@ class FASTTokenizer:
         state_str = " ".join(map(str, discretized_state))
         prefix = f"Task: {cleaned_text}, State: {state_str};\n"
         prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+
+        # Optional CoT reasoning tokens inserted between prefix and postfix.
+        # Encoded without BOS since they continue mid-sequence after the prefix.
+        if cot_reasoning is not None and len(cot_reasoning.strip()) > 0:
+            cot_tokens = self._paligemma_tokenizer.encode(cot_reasoning.strip(), add_bos=False)
+        else:
+            cot_tokens = []
 
         if actions is not None:
             # Tokenize actions with FAST tokenizer --> map to last tokens in PaliGemma vocab
@@ -88,12 +97,13 @@ class FASTTokenizer:
         else:
             postfix_tokens = []
 
-        # Create output token sequence & masks
-        # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
-        tokens = prefix_tokens + postfix_tokens
-        token_mask = [True] * len(tokens)
-        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
-        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only
+        # Create output token sequence & masks.
+        # AR mask: 0 on prefix (bidirectional), 1 on CoT+postfix (causal).
+        # Loss mask: False on prefix, True on CoT+postfix (train on reasoning and actions).
+        tokens = prefix_tokens + cot_tokens + postfix_tokens
+        token_mask = [True] * len(prefix_tokens) + [True] * len(cot_tokens) + [True] * len(postfix_tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * len(cot_tokens) + [1] * len(postfix_tokens)
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(cot_tokens) + [True] * len(postfix_tokens)
 
         # Pad tokens to max length
         tokens_len = len(tokens)
@@ -126,7 +136,7 @@ class FASTTokenizer:
 
         # Extract actions from decoded tokens
         raw_action_tokens = np.array(
-            self._paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[1].split("|")[0].strip())
+            self._paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[-1].split("|")[0].strip())
         )
         action_tokens = self._act_tokens_to_paligemma_tokens(raw_action_tokens)
         return self._fast_tokenizer.decode(
