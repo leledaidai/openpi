@@ -394,6 +394,44 @@ class ExtractFASTActions(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizePiCOTInputs(DataTransformFn):
+    """Tokenize inputs for PiCOT: produces separate prefix, CoT, and FAST action token arrays."""
+
+    tokenizer: _tokenizer.FASTTokenizer
+    max_cot_tokens: int = 512
+    max_fast_tokens: int = 64
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prompt = data.pop("prompt", None)
+        if prompt is None:
+            raise ValueError("Prompt is required for TokenizePiCOTInputs")
+        if not isinstance(prompt, str):
+            if hasattr(prompt, "item"):
+                prompt = prompt.item()
+            if isinstance(prompt, bytes):
+                prompt = prompt.decode("utf-8")
+
+        cot_reasoning = data.pop("cot_reasoning", None)
+        if cot_reasoning is not None and not isinstance(cot_reasoning, str):
+            if hasattr(cot_reasoning, "item"):
+                cot_reasoning = cot_reasoning.item()
+            elif isinstance(cot_reasoning, bytes):
+                cot_reasoning = cot_reasoning.decode("utf-8")
+            else:
+                cot_reasoning = str(cot_reasoning)
+
+        result = self.tokenizer.tokenize_picot(
+            prompt=prompt,
+            state=data["state"],
+            actions=data.get("actions"),
+            cot_reasoning=cot_reasoning,
+            max_cot_tokens=self.max_cot_tokens,
+            max_fast_tokens=self.max_fast_tokens,
+        )
+        return {**data, **result}
+
+
+@dataclasses.dataclass(frozen=True)
 class PromptFromLeRobotTask(DataTransformFn):
     """Extracts a prompt from the current LeRobot dataset task."""
 
@@ -421,51 +459,6 @@ class PadStatesAndActions(DataTransformFn):
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
-        return data
-
-
-@dataclasses.dataclass(frozen=True)
-class ReasoningDropout(DataTransformFn):
-    """Randomly drops CoT reasoning sections during training for robustness.
-
-    This transform takes a reasoning string formatted as "TAG1: content1 TAG2: content2 ..."
-    and randomly drops sections with the given probability.
-    """
-
-    dropout_prob: float = 0.0
-
-    def __call__(self, data: DataDict) -> DataDict:
-        if "reasoning" not in data or self.dropout_prob == 0.0:
-            return data
-
-        reasoning = data["reasoning"]
-        if not isinstance(reasoning, str):
-            reasoning = reasoning.item() if hasattr(reasoning, "item") else str(reasoning)
-
-        if len(reasoning) == 0:
-            return data
-
-        # Import here to avoid circular dependency
-        from openpi.utils.cot_utils import abbreviate_tag, get_cot_tags_list
-
-        # Split reasoning by @ separator (internal format from data loading)
-        if "@" in reasoning:
-            reasoning_parts = reasoning.split("@")
-            tags = [(reasoning_parts[i], reasoning_parts[i + 1]) for i in range(0, len(reasoning_parts), 2) if i + 1 < len(reasoning_parts)]
-        else:
-            # Already formatted as "TAG: content TAG: content"
-            # Parse it back
-            from openpi.utils.cot_utils import parse_reasoning_string
-            parsed = parse_reasoning_string(reasoning)
-            tags = [(tag, content) for tag, content in parsed.items()]
-
-        # Randomly keep sections based on dropout probability
-        subset = np.random.rand(len(tags)) > self.dropout_prob
-
-        # Reconstruct reasoning string
-        filtered_reasoning = " ".join([f"{tag} {content}" for (tag, content), is_kept in zip(tags, subset) if is_kept])
-
-        data["reasoning"] = filtered_reasoning
         return data
 
 

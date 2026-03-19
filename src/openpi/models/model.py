@@ -33,6 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    PI_COT = "pi_cot"
 
 
 # The model always expects these images
@@ -112,6 +113,10 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # PiCOT-specific: FAST-encoded action tokens (separate from CoT reasoning)
+    tokenized_fast_actions: at.Int[ArrayT, "*b fast_l"] | None = None
+    tokenized_fast_actions_mask: at.Bool[ArrayT, "*b fast_l"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -134,6 +139,8 @@ class Observation(Generic[ArrayT]):
             tokenized_cot_reasoning_mask=data.get("tokenized_cot_reasoning_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            tokenized_fast_actions=data.get("tokenized_fast_actions"),
+            tokenized_fast_actions_mask=data.get("tokenized_fast_actions_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -215,6 +222,8 @@ def preprocess_observation(
         tokenized_cot_reasoning_mask=observation.tokenized_cot_reasoning_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        tokenized_fast_actions=observation.tokenized_fast_actions,
+        tokenized_fast_actions_mask=observation.tokenized_fast_actions_mask,
     )
 
 

@@ -16,6 +16,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi_cot as pi_cot
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -103,8 +104,6 @@ class DataConfig:
     # Chain-of-Thought (CoT) configuration
     # Path to reasoning dataset JSON file (local path or HuggingFace repo)
     reasoning_dataset_path: str | None = None
-    # Reasoning dropout probability for training robustness
-    reasoning_dropout_prob: float = 0.0
 
 
 class GroupFactory(Protocol):
@@ -184,6 +183,25 @@ class ModelTransformFactory(GroupFactory):
                             action_dim=model_config.action_dim,
                         )
                     ],
+                )
+            case _model.ModelType.PI_COT:
+                assert isinstance(model_config, pi_cot.PiCOTConfig)
+                fast_tokenizer = _tokenizer.FASTTokenizer(
+                    model_config.max_token_len,
+                    fast_tokenizer_path=model_config.fast_tokenizer_path,
+                )
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.PrepareCoTPrompt(),
+                        _transforms.TokenizePiCOTInputs(
+                            tokenizer=fast_tokenizer,
+                            max_cot_tokens=model_config.max_cot_tokens,
+                            max_fast_tokens=model_config.max_fast_tokens,
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ]
                 )
 
 
@@ -458,9 +476,6 @@ class RLDSBridgeDataConfig(DataConfigFactory):
     # Path to reasoning dataset JSON file
     reasoning_dataset_path: str | None = None
 
-    # Reasoning dropout probability
-    reasoning_dropout_prob: float = 0.0
-
     # List of datasets to sample from: name, version, weight
     datasets: Sequence[bridge_rlds_dataset.RLDSDataset] = (
         bridge_rlds_dataset.RLDSDataset(
@@ -512,7 +527,6 @@ class RLDSBridgeDataConfig(DataConfigFactory):
             rlds_data_dir=self.rlds_data_dir,
             datasets=self.datasets,
             reasoning_dataset_path=self.reasoning_dataset_path,
-            reasoning_dropout_prob=self.reasoning_dropout_prob,
         )
 
 
@@ -1127,7 +1141,6 @@ _CONFIGS = [
             repo_id="bridge_orig",
             rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
             reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
-            reasoning_dropout_prob=0.3,
         ),
 
         batch_size=32,
@@ -1192,204 +1205,12 @@ _CONFIGS = [
             use_cot=True,
             max_cot_tokens=512,
             cot_loss_weight=1.0,
-            reasoning_dropout_prob=0.3,
         ),
 
         data=RLDSBridgeDataConfig(
             repo_id="bridge_orig",
             rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
             reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
-            reasoning_dropout_prob=0.3,
-        ),
-
-        batch_size=32,
-
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-
-        num_train_steps=30_000,
-
-        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
-    ),
-    # TrainConfig(
-    #     name="pi05_bridge_rlds_finetune_cot_weight_2",
-
-    #     model=pi0_config.Pi0Config(
-    #         pi05=True,
-    #         action_horizon=10,
-    #         discrete_state_input=True,
-    #         max_token_len=1024,  # Increased from default 200 to handle longer prompts
-    #         # Enable CoT
-    #         use_cot=True,
-    #         max_cot_tokens=1024,
-    #         cot_loss_weight=2.0,
-    #         reasoning_dropout_prob=0.3,
-    #     ),
-
-    #     data=RLDSBridgeDataConfig(
-    #         repo_id="bridge_orig",
-    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
-    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
-    #         reasoning_dropout_prob=0.3,
-    #     ),
-
-    #     batch_size=32,
-
-    #     lr_schedule=_optimizer.CosineDecaySchedule(
-    #         warmup_steps=10_000,
-    #         peak_lr=5e-5,
-    #         decay_steps=1_000_000,
-    #         decay_lr=5e-5,
-    #     ),
-
-    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-    #     ema_decay=0.999,
-
-    #     num_train_steps=30_000,
-
-    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
-    # ),
-    # TrainConfig(
-    #     name="pi05_bridge_rlds_finetune_cot_weight_05",
-
-    #     model=pi0_config.Pi0Config(
-    #         pi05=True,
-    #         action_horizon=10,
-    #         discrete_state_input=True,
-    #         max_token_len=1024,  # Increased from default 200 to handle longer prompts
-    #         # Enable CoT
-    #         use_cot=True,
-    #         max_cot_tokens=1024,
-    #         cot_loss_weight=0.5,
-    #         reasoning_dropout_prob=0.3,
-    #     ),
-
-    #     data=RLDSBridgeDataConfig(
-    #         repo_id="bridge_orig",
-    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
-    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
-    #         reasoning_dropout_prob=0.3,
-    #     ),
-
-    #     batch_size=32,
-
-    #     lr_schedule=_optimizer.CosineDecaySchedule(
-    #         warmup_steps=10_000,
-    #         peak_lr=5e-5,
-    #         decay_steps=1_000_000,
-    #         decay_lr=5e-5,
-    #     ),
-
-    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-    #     ema_decay=0.999,
-
-    #     num_train_steps=30_000,
-
-    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
-    # ),
-    # TrainConfig(
-    #     name="pi05_bridge_rlds_finetune_cot_weight_5",
-
-    #     model=pi0_config.Pi0Config(
-    #         pi05=True,
-    #         action_horizon=10,
-    #         discrete_state_input=True,
-    #         max_token_len=1024,  # Increased from default 200 to handle longer prompts
-    #         # Enable CoT
-    #         use_cot=True,
-    #         max_cot_tokens=1024,
-    #         cot_loss_weight=5.0,
-    #         reasoning_dropout_prob=0.3,
-    #     ),
-
-    #     data=RLDSBridgeDataConfig(
-    #         repo_id="bridge_orig",
-    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
-    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
-    #         reasoning_dropout_prob=0.3,
-    #     ),
-
-    #     batch_size=32,
-
-    #     lr_schedule=_optimizer.CosineDecaySchedule(
-    #         warmup_steps=10_000,
-    #         peak_lr=5e-5,
-    #         decay_steps=1_000_000,
-    #         decay_lr=5e-5,
-    #     ),
-
-    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-    #     ema_decay=0.999,
-
-    #     num_train_steps=30_000,
-
-    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
-    # ),
-    # TrainConfig(
-    #     name="pi05_bridge_rlds_finetune_cot_weight_01",
-
-    #     model=pi0_config.Pi0Config(
-    #         pi05=True,
-    #         action_horizon=10,
-    #         discrete_state_input=True,
-    #         max_token_len=1024,  # Increased from default 200 to handle longer prompts
-    #         # Enable CoT
-    #         use_cot=True,
-    #         max_cot_tokens=1024,
-    #         cot_loss_weight=0.1,
-    #         reasoning_dropout_prob=0.3,
-    #     ),
-
-    #     data=RLDSBridgeDataConfig(
-    #         repo_id="bridge_orig",
-    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
-    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
-    #         reasoning_dropout_prob=0.3,
-    #     ),
-
-    #     batch_size=32,
-
-    #     lr_schedule=_optimizer.CosineDecaySchedule(
-    #         warmup_steps=10_000,
-    #         peak_lr=5e-5,
-    #         decay_steps=1_000_000,
-    #         decay_lr=5e-5,
-    #     ),
-
-    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-    #     ema_decay=0.999,
-
-    #     num_train_steps=30_000,
-
-    #     weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
-    # ),
-    TrainConfig(
-        name="pi05_bridge_rlds_finetune_cot_compute_norm_stats",
-
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            discrete_state_input=True,
-            max_token_len=1024,  # Increased from default 200 to handle longer prompts
-            # Enable CoT
-            use_cot=True,
-            max_cot_tokens=1024,
-            cot_loss_weight=1.0,
-            reasoning_dropout_prob=0.3,
-        ),
-
-        data=RLDSBridgeDataConfig(
-            repo_id="bridge_orig",
-            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
-            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
-            reasoning_dropout_prob=0.3,
         ),
 
         batch_size=32,
@@ -1409,6 +1230,249 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
     ),
     
+    TrainConfig(
+        name="pi05_bridge_rlds_finetune_cot_compute_norm_stats",
+
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=True,
+            max_token_len=1024,  # Increased from default 200 to handle longer prompts
+            # Enable CoT
+            use_cot=True,
+            max_cot_tokens=1024,
+            cot_loss_weight=1.0,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+
+        batch_size=32,
+
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+
+        num_train_steps=30_000,
+
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
+    ),
+    # # Fine-tune PiCOT on Bridge dataset (RLDS format) with CoT reasoning.
+    # # Architecture: pi0.5-style flow matching + CoT tokens + FAST action tokens.
+    # # Weight loader: pi0.5 base checkpoint (shared dual-stream adaRMS architecture).
+    # TrainConfig(
+    #     name="pi_cot_bridge_rlds_finetune_cot",
+
+    #     model=pi_cot.PiCOTConfig(
+    #         action_dim=32,           # Bridge: 7-DoF arm + 1-DoF gripper
+    #         action_horizon=10,
+    #         max_token_len=200,      # prefix only (CoT + FAST are in separate arrays)
+    #         max_cot_tokens=512,     # match pi05_bridge_rlds_finetune_cot
+    #         max_fast_tokens=128,    # FAST typically ~10-20 tokens for (10, 8) actions
+    #         flow_matching_loss_weight=5.0,
+    #     ),
+
+    #     data=RLDSBridgeDataConfig(
+    #         repo_id="bridge_orig",
+    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+    #     ),
+
+    #     batch_size=32,
+    #     lr_schedule=_optimizer.CosineDecaySchedule(
+    #         warmup_steps=10_000,
+    #         peak_lr=5e-5,
+    #         decay_steps=1_000_000,
+    #         decay_lr=5e-5,
+    #     ),
+    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    #     ema_decay=0.999,
+    #     num_train_steps=30_000,
+    #     num_workers=0,  # required for RLDS data loader
+
+    #     weight_loader=weight_loaders.CheckpointWeightLoader(
+    #         "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"
+    #     ),
+    # ),
+    TrainConfig(
+        name="pi_cot_bridge_rlds_finetune_cot_test",
+
+        model=pi_cot.PiCOTConfig(
+            action_dim=32,           # Bridge: 7-DoF arm + 1-DoF gripper
+            action_horizon=10,
+            max_token_len=200,      # prefix only (CoT + FAST are in separate arrays)
+            max_cot_tokens=768,
+            max_fast_tokens=128,
+            flow_matching_loss_weight=5.0,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=40_000,
+        num_workers=0,  # required for RLDS data loader
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"
+        ),
+    ),
+    TrainConfig(
+        name="pi_cot_bridge",
+
+        model=pi_cot.PiCOTConfig(
+            action_dim=32,           # Bridge: 7-DoF arm + 1-DoF gripper
+            action_horizon=10,
+            max_token_len=200,      # prefix only (CoT + FAST are in separate arrays)
+            max_cot_tokens=768,
+            max_fast_tokens=128,
+            flow_matching_loss_weight=5.0,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=300_000,
+        num_workers=0,  # required for RLDS data loader
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"
+        ),
+    ),
+    TrainConfig(
+        name="pi_cot_bridge_10",
+
+        model=pi_cot.PiCOTConfig(
+            action_dim=32,           # Bridge: 7-DoF arm + 1-DoF gripper
+            action_horizon=10,
+            max_token_len=200,      # prefix only (CoT + FAST are in separate arrays)
+            max_cot_tokens=768,
+            max_fast_tokens=128,
+            flow_matching_loss_weight=10.0,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=300_000,
+        num_workers=0,  # required for RLDS data loader
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"
+        ),
+    ),
+    TrainConfig(
+        name="pi_cot_bridge_15",
+
+        model=pi_cot.PiCOTConfig(
+            action_dim=32,           # Bridge: 7-DoF arm + 1-DoF gripper
+            action_horizon=10,
+            max_token_len=200,      # prefix only (CoT + FAST are in separate arrays)
+            max_cot_tokens=768,
+            max_fast_tokens=128,
+            flow_matching_loss_weight=15.0,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=200_000,
+        num_workers=0,  # required for RLDS data loader
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"
+        ),
+    ),
+    TrainConfig(
+        name="pi_cot_bridge_20",
+
+        model=pi_cot.PiCOTConfig(
+            action_dim=32,           # Bridge: 7-DoF arm + 1-DoF gripper
+            action_horizon=10,
+            max_token_len=200,      # prefix only (CoT + FAST are in separate arrays)
+            max_cot_tokens=768,
+            max_fast_tokens=128,
+            flow_matching_loss_weight=20.0,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=200_000,
+        num_workers=0,  # required for RLDS data loader
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"
+        ),
+    ),
     #
     # RoboArena configs.
     #

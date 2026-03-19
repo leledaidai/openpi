@@ -148,8 +148,105 @@ class FASTTokenizer:
             tokens = np.array(tokens)
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
 
+    def tokenize_picot(
+        self,
+        prompt: str,
+        state: np.ndarray,
+        actions: np.ndarray | None,
+        cot_reasoning: str | None,
+        max_cot_tokens: int,
+        max_fast_tokens: int,
+    ) -> dict[str, np.ndarray]:
+        """Tokenize inputs for PiCOT model, returning separate arrays for prefix, CoT, and FAST tokens.
 
-###########################################################################
+        Args:
+            prompt: Text prompt describing the task.
+            state: Robot state array to discretize into the prefix.
+            actions: Continuous actions to encode with FAST tokenizer. If None, fast token arrays are zero-padded.
+            cot_reasoning: Optional chain-of-thought reasoning string.
+            max_cot_tokens: Fixed length for CoT token arrays (pad/truncate).
+            max_fast_tokens: Fixed length for FAST action token arrays (pad/truncate).
+
+        Returns:
+            Dict with six arrays:
+              tokenized_prompt / tokenized_prompt_mask  [max_token_len]
+              tokenized_cot_reasoning / tokenized_cot_reasoning_mask  [max_cot_tokens]
+              tokenized_fast_actions / tokenized_fast_actions_mask  [max_fast_tokens]
+        """
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+
+        # Discretize state into 256 bins (same convention as FASTTokenizer.tokenize)
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
+        prefix_token_ids = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+
+        # Pad/truncate prefix to self._max_len
+        prefix_len = len(prefix_token_ids)
+        if prefix_len < self._max_len:
+            pad = [0] * (self._max_len - prefix_len)
+            prefix_tokens = np.array(prefix_token_ids + pad, dtype=np.int32)
+            prefix_mask = np.array([True] * prefix_len + [False] * (self._max_len - prefix_len), dtype=np.bool_)
+        else:
+            if prefix_len > self._max_len:
+                logging.warning(
+                    f"PiCOT prefix length ({prefix_len}) exceeds max length ({self._max_len}), truncating."
+                )
+            prefix_tokens = np.array(prefix_token_ids[: self._max_len], dtype=np.int32)
+            prefix_mask = np.ones(self._max_len, dtype=np.bool_)
+
+        # CoT tokens: encode reasoning without BOS, pad to max_cot_tokens
+        if cot_reasoning is not None and len(cot_reasoning.strip()) > 0:
+            cot_ids = self._paligemma_tokenizer.encode(cot_reasoning.strip(), add_bos=False, add_eos=True)
+        else:
+            cot_ids = []
+
+        cot_len = len(cot_ids)
+        if cot_len < max_cot_tokens:
+            pad = [0] * (max_cot_tokens - cot_len)
+            cot_tokens = np.array(cot_ids + pad, dtype=np.int32)
+            cot_mask = np.array([True] * cot_len + [False] * (max_cot_tokens - cot_len), dtype=np.bool_)
+        else:
+            if cot_len > max_cot_tokens:
+                logging.warning(
+                    f"PiCOT CoT length ({cot_len}) exceeds max_cot_tokens ({max_cot_tokens}), truncating."
+                )
+            cot_tokens = np.array(cot_ids[:max_cot_tokens], dtype=np.int32)
+            cot_mask = np.ones(max_cot_tokens, dtype=np.bool_)
+
+        # FAST action tokens: "Action: " + FAST_ids + "|" EOS, pad to max_fast_tokens
+        if actions is not None:
+            action_token_ids = self._fast_tokenizer(actions[None])[0]
+            action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_token_ids)
+            fast_ids = (
+                self._paligemma_tokenizer.encode("Action: ")
+                + action_tokens_in_pg.tolist()
+                + self._paligemma_tokenizer.encode("|", add_eos=True)
+            )
+        else:
+            fast_ids = []
+
+        fast_len = len(fast_ids)
+        if fast_len < max_fast_tokens:
+            pad = [0] * (max_fast_tokens - fast_len)
+            fast_tokens = np.array(fast_ids + pad, dtype=np.int32)
+            fast_mask = np.array([True] * fast_len + [False] * (max_fast_tokens - fast_len), dtype=np.bool_)
+        else:
+            if fast_len > max_fast_tokens:
+                logging.warning(
+                    f"PiCOT FAST token length ({fast_len}) exceeds max_fast_tokens ({max_fast_tokens}), truncating."
+                )
+            fast_tokens = np.array(fast_ids[:max_fast_tokens], dtype=np.int32)
+            fast_mask = np.ones(max_fast_tokens, dtype=np.bool_)
+
+        return {
+            "tokenized_prompt": prefix_tokens,
+            "tokenized_prompt_mask": prefix_mask,
+            "tokenized_cot_reasoning": cot_tokens,
+            "tokenized_cot_reasoning_mask": cot_mask,
+            "tokenized_fast_actions": fast_tokens,
+            "tokenized_fast_actions_mask": fast_mask,
+        }
 ## The tokenizers below are used for RoboArena baseline implementations. ##
 ## They are *not* used for pi0-style models.                             ##
 ###########################################################################

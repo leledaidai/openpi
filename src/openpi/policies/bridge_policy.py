@@ -10,7 +10,7 @@ from openpi.models import model as _model
 def make_bridge_example() -> dict:
     """Creates a random input example for the Bridge-style policy."""
     return {
-        "observation/state": np.random.rand(8),
+        "observation/state": np.random.rand(7),
         "observation/primary_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "prompt": "do something",
         # Optional for training:

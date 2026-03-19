@@ -194,13 +194,8 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **aux,
     }
-
-    # Add CoT-specific metrics from auxiliary output
-    if 'cot_loss' in aux:
-        info["cot_loss"] = aux['cot_loss']
-    if 'action_loss' in aux:
-        info["action_loss"] = aux['action_loss']
 
     return new_state, info
 

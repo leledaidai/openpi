@@ -2,14 +2,15 @@
 # 遇到错误时退出
 set -e
 
-# 检查是否提供了参数
-if [ $# -ne 1 ]; then
-    echo "用法: $0 <config_name>"
-    echo "示例: $0 pi05_bridge_rlds_finetune_cot_weight_1"
+# 检查是否提供了两个参数
+if [ $# -ne 2 ]; then
+    echo "用法: $0 <config_name> <exp_name>"
+    echo "示例: $0 pi05_bridge_rlds_finetune_cot_weight_1 my_experiment"
     exit 1
 fi
 
 CONFIG_NAME="$1"
+EXP_NAME="$2"
 
 # 进入工作目录（请根据实际情况调整路径，或使用绝对路径）
 cd /inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi || { echo "目录 openpi 不存在"; exit 1; }
@@ -23,9 +24,11 @@ conda deactivate 2>/dev/null || true
 # 设置环境变量
 export OPENPI_DATA_HOME="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache"
 export WANDB_MODE="offline"
+export HF_HUB_OFFLINE=1
+export HF_HOME=/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache
 export XLA_PYTHON_CLIENT_MEM_FRACTION="0.9"
 
 # 运行训练命令，使用传入的配置名称
 uv run scripts/train.py "$CONFIG_NAME" \
-    --exp-name="$CONFIG_NAME" \
+    --exp-name="$EXP_NAME" \
     --overwrite
