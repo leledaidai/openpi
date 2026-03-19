@@ -73,6 +73,38 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
+@dataclasses.dataclass(frozen=True)
+class Pi0FASTImplicitWeightLoader(WeightLoader):
+    """Weight loader for Pi0-FAST-Implicit (CODI-style) models.
+
+    Loads a standard Pi0-FAST base checkpoint and bootstraps the separate
+    ``decoder_llm`` from the main ``PaliGemma/llm`` weights, matching the
+    CODI initialisation strategy of starting both student and decoder from
+    the same pretrained language model.
+
+    When resuming from a Pi0FASTImplicit checkpoint (which already contains
+    ``decoder_llm``), use ``CheckpointWeightLoader`` instead — both LLM and
+    decoder weights will be loaded directly.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        # Load base checkpoint (contains only PaliGemma weights).
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        # Fill LoRA weights from reference (ShapeDtypeStruct placeholders).
+        merged = _merge_params(loaded_params, params, missing_regex=".*lora.*")
+
+        # Bootstrap decoder_llm from PaliGemma/llm if the model expects it
+        # but the checkpoint does not contain it (i.e., this is a base checkpoint).
+        if "decoder_llm" not in merged and "decoder_llm" in params:
+            pg_llm_params = merged.get("PaliGemma", {}).get("llm", {})
+            merged = dict(merged)
+            merged["decoder_llm"] = pg_llm_params
+
+        return merged
+
+
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 

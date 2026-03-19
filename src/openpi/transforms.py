@@ -432,6 +432,72 @@ class TokenizePiCOTInputs(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeFASTInputsImplicit(DataTransformFn):
+    """Tokenize inputs for Pi0-FAST-Implicit (CODI-style) training.
+
+    Calls both tokenize() (for teacher path: prefix+CoT+actions) and
+    tokenize_implicit() (for student path: prefix-only, action-only, per-section CoT).
+    All fields are merged into one data dict for the model.
+    """
+
+    tokenizer: _tokenizer.FASTTokenizer
+    num_latent: int = 9
+    max_prefix_len: int = 80
+    max_action_token_len: int = 80
+    max_cot_step_len: int = 100
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prompt = data.pop("prompt", None)
+        if prompt is None:
+            raise ValueError("Prompt is required for TokenizeFASTInputsImplicit")
+        if not isinstance(prompt, str):
+            if hasattr(prompt, "item"):
+                prompt = prompt.item()
+            if isinstance(prompt, bytes):
+                prompt = prompt.decode("utf-8")
+
+        cot_reasoning = data.pop("cot_reasoning", None)
+        if cot_reasoning is not None and not isinstance(cot_reasoning, str):
+            if hasattr(cot_reasoning, "item"):
+                cot_reasoning = cot_reasoning.item()
+            elif isinstance(cot_reasoning, bytes):
+                cot_reasoning = cot_reasoning.decode("utf-8")
+            else:
+                cot_reasoning = str(cot_reasoning)
+
+        state = data["state"]
+        actions = data.get("actions")
+
+        # Teacher path: full sequence (prefix + CoT + actions)
+        tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize(
+            prompt, state, actions, cot_reasoning=cot_reasoning
+        )
+
+        # Student path: prefix-only, action-only, per-section CoT
+        implicit_fields = self.tokenizer.tokenize_implicit(
+            prompt=prompt,
+            state=state,
+            actions=actions,
+            cot_reasoning=cot_reasoning,
+            num_latent=self.num_latent,
+            max_prefix_len=self.max_prefix_len,
+            max_action_token_len=self.max_action_token_len,
+            max_cot_step_len=self.max_cot_step_len,
+        )
+
+        return {
+            **data,
+            # Teacher path fields
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": token_mask,
+            "token_ar_mask": ar_mask,
+            "token_loss_mask": loss_mask,
+            # Student path fields
+            **implicit_fields,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class PromptFromLeRobotTask(DataTransformFn):
     """Extracts a prompt from the current LeRobot dataset task."""
 

@@ -16,6 +16,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_fast_implicit as pi0_fast_implicit
 import openpi.models.pi_cot as pi_cot
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -202,6 +203,38 @@ class ModelTransformFactory(GroupFactory):
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ]
+                )
+            case _model.ModelType.PI0_FAST_IMPLICIT:
+                assert isinstance(model_config, pi0_fast_implicit.Pi0FASTImplicitConfig)
+                tokenizer_cls = (
+                    _tokenizer.FASTTokenizer
+                    if model_config.fast_model_tokenizer is None
+                    else model_config.fast_model_tokenizer
+                )
+                tokenizer_kwargs = (
+                    {} if model_config.fast_model_tokenizer_kwargs is None else model_config.fast_model_tokenizer_kwargs
+                )
+                fast_tok = tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.PrepareCoTPrompt(),
+                        _transforms.TokenizeFASTInputsImplicit(
+                            tokenizer=fast_tok,
+                            num_latent=model_config.num_latent,
+                            max_prefix_len=model_config.max_prefix_len,
+                            max_action_token_len=model_config.max_action_token_len,
+                            max_cot_step_len=model_config.max_cot_step_len,
+                        ),
+                    ],
+                    outputs=[
+                        _transforms.ExtractFASTActions(
+                            fast_tok,
+                            action_horizon=model_config.action_horizon,
+                            action_dim=model_config.action_dim,
+                        )
+                    ],
                 )
 
 
@@ -1126,39 +1159,39 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
-    TrainConfig(
-        name="pi0_fast_bridge_rlds_finetune_cot",
+    # TrainConfig(
+    #     name="pi0_fast_bridge_rlds_finetune_cot",
 
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=8,          # match your robot's action dimension
-            action_horizon=10,
-            max_token_len=1024,     # must be large enough: prefix + CoT + actions
-            use_cot=True,
-            max_cot_tokens=256,    # tune based on your reasoning length
-        ),
+    #     model=pi0_fast.Pi0FASTConfig(
+    #         action_dim=8,          # match your robot's action dimension
+    #         action_horizon=10,
+    #         max_token_len=1024,     # must be large enough: prefix + CoT + actions
+    #         use_cot=True,
+    #         max_cot_tokens=256,    # tune based on your reasoning length
+    #     ),
 
-        data=RLDSBridgeDataConfig(
-            repo_id="bridge_orig",
-            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
-            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
-        ),
+    #     data=RLDSBridgeDataConfig(
+    #         repo_id="bridge_orig",
+    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",#注意这里要写根目录
+    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+    #     ),
 
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.99,
-        num_train_steps=30_000,
-        num_workers=0,  # required for RLDS data loader
+    #     batch_size=32,
+    #     lr_schedule=_optimizer.CosineDecaySchedule(
+    #         warmup_steps=1_000,
+    #         peak_lr=5e-5,
+    #         decay_steps=1_000_000,
+    #         decay_lr=5e-5,
+    #     ),
+    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    #     ema_decay=0.99,
+    #     num_train_steps=30_000,
+    #     num_workers=0,  # required for RLDS data loader
 
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi0_fast_base/params"
-        ),
-    ),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader(
+    #         "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi0_fast_base/params"
+    #     ),
+    # ),
     TrainConfig(
         name="pi05_bridge_lerobot_finetune",
 
@@ -1478,6 +1511,134 @@ _CONFIGS = [
     #
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    # Pi0-FAST Implicit CoT (CODI-style) training on Bridge dataset
+    TrainConfig(
+        name="pi0_fast_bridge_rlds_implicit_cot",
+
+        model=pi0_fast_implicit.Pi0FASTImplicitConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=1024,        # teacher path: prefix + CoT + actions 教师模型的全部token数量
+            use_cot=True,
+            max_cot_tokens=768,        # teacher path CoT token budget 教师模型的显示cot token数量
+            num_latent=9,              # one latent per CoT section
+            max_prefix_len=110,         # student prefix budget 学生模型的前缀token数量
+            max_action_token_len=80,   # student action token budget 学生模型的动作token数量
+            max_cot_step_len=370,      # per-section CoT token budget 每步decoder解码出的文本最大token数量
+            distill_loss_factor=1.0,
+            explain_loss_factor=1.0,
+            ref_loss_factor=1.0,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+
+        batch_size=32,  # smaller batch due to higher memory (two forward passes + KV cache)
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        num_train_steps=300_000,
+        num_workers=0,  # required for RLDS data loader
+
+        weight_loader=weight_loaders.Pi0FASTImplicitWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+    ),
+    TrainConfig(
+        name="pi0_fast_bridge_rlds_implicit_cot_lr_s1",
+
+        model=pi0_fast_implicit.Pi0FASTImplicitConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=1024,        # teacher path: prefix + CoT + actions 教师模型的全部token数量
+            use_cot=True,
+            max_cot_tokens=768,        # teacher path CoT token budget 教师模型的显示cot token数量
+            num_latent=9,              # one latent per CoT section
+            max_prefix_len=110,         # student prefix budget 学生模型的前缀token数量
+            max_action_token_len=80,   # student action token budget 学生模型的动作token数量
+            max_cot_step_len=370,      # per-section CoT token budget 每步decoder解码出的文本最大token数量
+            distill_loss_factor=1.0,
+            explain_loss_factor=1.0,
+            ref_loss_factor=1.0,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+
+        batch_size=64,  # smaller batch due to higher memory (teacher + student + decoder passes)
+        # Scheme 1: conservative paper-style transfer.
+        # Gemma-2B is closer to the paper's larger-model regime than to small-model settings, and this setup
+        # is more optimization-sensitive than plain CODI because it jointly trains teacher/student VLA paths,
+        # latent distillation, and a separate decoder LLM. Use a lower LR and shorter run for stability.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=6_000,
+            peak_lr=5e-5,
+            decay_steps=160_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(b2=0.999, weight_decay=0.01, clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        num_train_steps=160_000,
+        num_workers=0,  # required for RLDS data loader
+
+        weight_loader=weight_loaders.Pi0FASTImplicitWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+    ),
+    TrainConfig(
+        name="pi0_fast_bridge_rlds_implicit_cot_lr_s2",
+
+        model=pi0_fast_implicit.Pi0FASTImplicitConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=1024,        # teacher path: prefix + CoT + actions 教师模型的全部token数量
+            use_cot=True,
+            max_cot_tokens=768,        # teacher path CoT token budget 教师模型的显示cot token数量
+            num_latent=9,              # one latent per CoT section
+            max_prefix_len=110,         # student prefix budget 学生模型的前缀token数量
+            max_action_token_len=80,   # student action token budget 学生模型的动作token数量
+            max_cot_step_len=370,      # per-section CoT token budget 每步decoder解码出的文本最大token数量
+            distill_loss_factor=1.0,
+            explain_loss_factor=1.0,
+            ref_loss_factor=1.0,
+        ),
+
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+
+        batch_size=64,  # smaller batch due to higher memory (teacher + student + decoder passes)
+        # Scheme 3: aggressive paper transfer.
+        # Keeps the same model/data setup, but increases LR and total optimization exposure to favor faster
+        # adaptation when the target domain is far from the initialization distribution.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=4_000,
+            peak_lr=8e-5,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(b2=0.999, weight_decay=0.01, clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        num_train_steps=200_000,
+        num_workers=0,  # required for RLDS data loader
+
+        weight_loader=weight_loaders.Pi0FASTImplicitWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

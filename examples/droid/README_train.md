@@ -34,6 +34,9 @@ uv run --group rlds scripts/compute_norm_stats.py --config-name pi05_full_droid_
 ```
 uv run --group rlds scripts/compute_norm_stats.py --config-name pi05_bridge_rlds_finetune_cot_compute_norm_stats --max-frames 10_000_000
 
+uv run --group rlds scripts/compute_norm_stats.py --config-name pi0_fast_bridge_rlds_implicit_cot --max-frames 10_000_000
+
+
 Run training:
 ```bash
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --group rlds scripts/train.py pi05_full_droid_finetune --exp-name=my_experiment --overwrite

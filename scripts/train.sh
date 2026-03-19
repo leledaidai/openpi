@@ -31,4 +31,5 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION="0.9"
 # 运行训练命令，使用传入的配置名称
 uv run scripts/train.py "$CONFIG_NAME" \
     --exp-name="$EXP_NAME" \
+    --fsdp-devices 8 \
     --overwrite

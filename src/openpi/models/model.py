@@ -34,6 +34,7 @@ class ModelType(enum.Enum):
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
     PI_COT = "pi_cot"
+    PI0_FAST_IMPLICIT = "pi0_fast_implicit"
 
 
 # The model always expects these images
@@ -117,6 +118,21 @@ class Observation(Generic[ArrayT]):
     tokenized_fast_actions: at.Int[ArrayT, "*b fast_l"] | None = None
     tokenized_fast_actions_mask: at.Bool[ArrayT, "*b fast_l"] | None = None
 
+    # Pi0-FAST-Implicit CoT fields (CODI-style)
+    # Prefix-only tokens (no CoT, no actions): [batch, prefix_len]
+    tokenized_prefix: at.Int[ArrayT, "*b pl"] | None = None
+    tokenized_prefix_mask: at.Bool[ArrayT, "*b pl"] | None = None
+    # AR mask for prefix: all zeros (bidirectional)
+    prefix_ar_mask: at.Int[ArrayT, "*b pl"] | None = None
+    # FAST action tokens only: [batch, action_token_len]
+    tokenized_action_tokens: at.Int[ArrayT, "*b al"] | None = None
+    tokenized_action_mask: at.Bool[ArrayT, "*b al"] | None = None
+    # Per-section CoT tokens: [batch, num_latent, step_len]
+    cot_step_tokens: at.Int[ArrayT, "*b k sl"] | None = None
+    cot_step_masks: at.Bool[ArrayT, "*b k sl"] | None = None
+    # Position of action start in prompt tokens (before image offset)
+    ref_answer_position: at.Int[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -141,6 +157,14 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             tokenized_fast_actions=data.get("tokenized_fast_actions"),
             tokenized_fast_actions_mask=data.get("tokenized_fast_actions_mask"),
+            tokenized_prefix=data.get("tokenized_prefix"),
+            tokenized_prefix_mask=data.get("tokenized_prefix_mask"),
+            prefix_ar_mask=data.get("prefix_ar_mask"),
+            tokenized_action_tokens=data.get("tokenized_action_tokens"),
+            tokenized_action_mask=data.get("tokenized_action_mask"),
+            cot_step_tokens=data.get("cot_step_tokens"),
+            cot_step_masks=data.get("cot_step_masks"),
+            ref_answer_position=data.get("ref_answer_position"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -224,6 +248,14 @@ def preprocess_observation(
         token_loss_mask=observation.token_loss_mask,
         tokenized_fast_actions=observation.tokenized_fast_actions,
         tokenized_fast_actions_mask=observation.tokenized_fast_actions_mask,
+        tokenized_prefix=observation.tokenized_prefix,
+        tokenized_prefix_mask=observation.tokenized_prefix_mask,
+        prefix_ar_mask=observation.prefix_ar_mask,
+        tokenized_action_tokens=observation.tokenized_action_tokens,
+        tokenized_action_mask=observation.tokenized_action_mask,
+        cot_step_tokens=observation.cot_step_tokens,
+        cot_step_masks=observation.cot_step_masks,
+        ref_answer_position=observation.ref_answer_position,
     )
 
 

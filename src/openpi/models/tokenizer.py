@@ -247,9 +247,205 @@ class FASTTokenizer:
             "tokenized_fast_actions": fast_tokens,
             "tokenized_fast_actions_mask": fast_mask,
         }
+
+    def tokenize_implicit(
+        self,
+        prompt: str,
+        state: np.ndarray,
+        actions: np.ndarray | None,
+        cot_reasoning: str | None,
+        num_latent: int,
+        max_prefix_len: int,
+        max_action_token_len: int,
+        max_cot_step_len: int,
+    ) -> dict[str, np.ndarray]:
+        """Tokenize inputs for Pi0-FAST-Implicit (CODI-style) training.
+
+        Returns separate arrays for:
+          - prefix-only tokens (no CoT, no actions)
+          - FAST action tokens only
+          - per-section CoT tokens: shape [num_latent, max_cot_step_len]
+          - ref_answer_position: length of valid prefix tokens
+
+        Args:
+            prompt: Text prompt describing the task.
+            state: Robot state array.
+            actions: Continuous actions (encoded with FAST tokenizer). If None, action arrays are zero-padded.
+            cot_reasoning: Optional chain-of-thought reasoning string.
+            num_latent: Number of latent tokens (= number of CoT sections).
+            max_prefix_len: Max token budget for prefix-only sequence.
+            max_action_token_len: Max token budget for FAST action tokens.
+            max_cot_step_len: Max token budget per CoT section.
+
+        Returns:
+            Dict with keys:
+              tokenized_prefix / tokenized_prefix_mask  [max_prefix_len]
+              prefix_ar_mask  [max_prefix_len]   (all zeros = bidirectional)
+              tokenized_action_tokens / tokenized_action_mask  [max_action_token_len]
+              cot_step_tokens / cot_step_masks  [num_latent, max_cot_step_len]
+              ref_answer_position  scalar int32 = prefix_len + cot_full_len (action start in tokenized_prompt)
+        """
+        from openpi.utils.cot_utils import get_cot_tags_list
+
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+
+        # Build prefix: same as FASTTokenizer.tokenize
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        prefix_str = f"Task: {cleaned_text}, State: {state_str};\n"
+        prefix_ids = self._paligemma_tokenizer.encode(prefix_str, add_bos=True)
+        prefix_valid_len = len(prefix_ids)
+
+        # Pad/truncate prefix to max_prefix_len
+        if prefix_valid_len < max_prefix_len:
+            pad = [0] * (max_prefix_len - prefix_valid_len)
+            prefix_tokens = np.array(prefix_ids + pad, dtype=np.int32)
+            prefix_mask = np.array(
+                [True] * prefix_valid_len + [False] * (max_prefix_len - prefix_valid_len), dtype=np.bool_
+            )
+        else:
+            if prefix_valid_len > max_prefix_len:
+                logging.warning(
+                    f"Implicit CoT prefix length ({prefix_valid_len}) exceeds max_prefix_len ({max_prefix_len}), truncating."
+                )
+            prefix_tokens = np.array(prefix_ids[:max_prefix_len], dtype=np.int32)
+            prefix_mask = np.ones(max_prefix_len, dtype=np.bool_)
+            prefix_valid_len = max_prefix_len
+
+        # AR mask for prefix: all zeros (bidirectional)
+        prefix_ar = np.zeros(max_prefix_len, dtype=np.int32)
+
+        # FAST action tokens only: "Action: " + FAST_ids + "|" EOS
+        if actions is not None:
+            action_token_ids = self._fast_tokenizer(actions[None])[0]
+            action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_token_ids)
+            action_ids = (
+                self._paligemma_tokenizer.encode("Action: ")
+                + action_tokens_in_pg.tolist()
+                + self._paligemma_tokenizer.encode("|", add_eos=True)
+            )
+        else:
+            action_ids = []
+
+        action_valid_len = len(action_ids)
+        if action_valid_len < max_action_token_len:
+            pad = [0] * (max_action_token_len - action_valid_len)
+            action_tokens = np.array(action_ids + pad, dtype=np.int32)
+            action_mask = np.array(
+                [True] * action_valid_len + [False] * (max_action_token_len - action_valid_len), dtype=np.bool_
+            )
+        else:
+            if action_valid_len > max_action_token_len:
+                logging.warning(
+                    f"Implicit CoT action token length ({action_valid_len}) exceeds max_action_token_len ({max_action_token_len}), truncating."
+                )
+            action_tokens = np.array(action_ids[:max_action_token_len], dtype=np.int32)
+            action_mask = np.ones(max_action_token_len, dtype=np.bool_)
+
+        # Split CoT reasoning by sections
+        cot_sections = _split_cot_by_sections(cot_reasoning, get_cot_tags_list(), num_latent)
+
+        # Tokenize each CoT section
+        step_tokens_list = []
+        step_masks_list = []
+        for section_text in cot_sections:
+            if section_text and len(section_text.strip()) > 0:
+                section_ids = self._paligemma_tokenizer.encode(section_text.strip(), add_bos=False, add_eos=True)
+            else:
+                section_ids = []
+
+            step_valid_len = len(section_ids)
+            if step_valid_len < max_cot_step_len:
+                pad = [0] * (max_cot_step_len - step_valid_len)
+                step_tok = np.array(section_ids + pad, dtype=np.int32)
+                step_msk = np.array(
+                    [True] * step_valid_len + [False] * (max_cot_step_len - step_valid_len), dtype=np.bool_
+                )
+            else:
+                if step_valid_len > max_cot_step_len:
+                    logging.warning(
+                        f"CoT section length ({step_valid_len}) exceeds max_cot_step_len ({max_cot_step_len}), truncating."
+                    )
+                step_tok = np.array(section_ids[:max_cot_step_len], dtype=np.int32)
+                step_msk = np.ones(max_cot_step_len, dtype=np.bool_)
+
+            step_tokens_list.append(step_tok)
+            step_masks_list.append(step_msk)
+
+        cot_step_tokens = np.stack(step_tokens_list, axis=0)  # [num_latent, max_cot_step_len]
+        cot_step_masks = np.stack(step_masks_list, axis=0)    # [num_latent, max_cot_step_len]
+
+        # Compute ref_answer_position = prefix_len + cot_full_len
+        # This is the position where action tokens START in tokenized_prompt (before img offset)
+        if cot_reasoning is not None and len(cot_reasoning.strip()) > 0:
+            cot_full_ids = self._paligemma_tokenizer.encode(cot_reasoning.strip(), add_bos=False)
+            cot_full_len = len(cot_full_ids)
+        else:
+            cot_full_len = 0
+        ref_answer_position = np.int32(prefix_valid_len + cot_full_len)
+
+        return {
+            "tokenized_prefix": prefix_tokens,
+            "tokenized_prefix_mask": prefix_mask,
+            "prefix_ar_mask": prefix_ar,
+            "tokenized_action_tokens": action_tokens,
+            "tokenized_action_mask": action_mask,
+            "cot_step_tokens": cot_step_tokens,
+            "cot_step_masks": cot_step_masks,
+            "ref_answer_position": ref_answer_position,
+        }
+
 ## The tokenizers below are used for RoboArena baseline implementations. ##
 ## They are *not* used for pi0-style models.                             ##
 ###########################################################################
+
+
+def _split_cot_by_sections(
+    cot_text: str | None,
+    cot_tags: list[str],
+    num_latent: int,
+) -> list[str]:
+    """Split a CoT reasoning string into per-section strings based on tag boundaries.
+
+    Each tag marks the start of a section. The content for section i runs from
+    tag[i] up to (but not including) tag[i+1] or end of string.
+    If there are fewer tags than num_latent, pad with empty strings.
+
+    Args:
+        cot_text: Full CoT reasoning string, e.g. "TASK: ... PLAN: ... ACTION: ..."
+        cot_tags: Ordered list of tag strings (e.g. ["TASK:", "PLAN:", ...]).
+        num_latent: Number of latent tokens / sections to produce.
+
+    Returns:
+        List of strings of length num_latent. Empty string for missing sections.
+    """
+    if not cot_text or not cot_text.strip():
+        return [""] * num_latent
+
+    sections = []
+    for i, tag in enumerate(cot_tags[:num_latent]):
+        if tag not in cot_text:
+            sections.append("")
+            continue
+
+        start_idx = cot_text.find(tag)
+        # Content starts after the tag itself
+        content_start = start_idx + len(tag)
+
+        # Find end: start of next tag that actually exists in the string
+        end_idx = len(cot_text)
+        for next_tag in cot_tags[i + 1 :]:
+            next_pos = cot_text.find(next_tag, content_start)
+            if next_pos != -1:
+                end_idx = min(end_idx, next_pos)
+
+        sections.append(cot_text[content_start:end_idx].strip())
+
+    # Pad if needed
+    while len(sections) < num_latent:
+        sections.append("")
+
+    return sections[:num_latent]
 
 
 class BinningTokenizer:

@@ -16,7 +16,8 @@
       "Bash(timeout 30 uv run:*)",
       "Bash(uv run:*)",
       "Bash(which python3 && python3 -c \"import flax\" 2>&1 || true; ls /inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi/.venv/bin/python* 2>/dev/null | head -5)",
-      "Bash(.venv/bin/python -c \"\nimport tensorflow_datasets as tfds\nbuilder = tfds.builder\\('bridge_orig', data_dir='/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge', version='1.0.0'\\)\ninfo = builder.info\nprint\\('State feature:', info.features['steps']['observation']['state']\\)\nprint\\('Action feature:', info.features['steps']['action']\\)\n\" 2>&1 | tail -5)"
+      "Bash(.venv/bin/python -c \"\nimport tensorflow_datasets as tfds\nbuilder = tfds.builder\\('bridge_orig', data_dir='/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge', version='1.0.0'\\)\ninfo = builder.info\nprint\\('State feature:', info.features['steps']['observation']['state']\\)\nprint\\('Action feature:', info.features['steps']['action']\\)\n\" 2>&1 | tail -5)",
+      "Bash(~/.local/bin/uv run:*)"
     ]
   }
 }

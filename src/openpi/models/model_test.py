@@ -1,12 +1,11 @@
-from flax import nnx
 import jax
-import pytest
+import numpy as np
 
-from openpi.models import model as _model
+from openpi import transforms as _transforms
 from openpi.models import pi0_config
 from openpi.models import pi0_fast
+from openpi.models import pi0_fast_implicit
 from openpi.models import pi_cot
-from openpi.shared import download
 from openpi.shared import nnx_utils
 
 
@@ -124,3 +123,45 @@ def test_pi_cot_model():
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=2)
     assert actions.shape == (batch_size, config.action_horizon, config.action_dim)
 
+
+def test_pi0_fast_implicit_inference_generates_tokens_then_decodes_actions():
+    key = jax.random.key(0)
+    config = pi0_fast_implicit.Pi0FASTImplicitConfig(
+        paligemma_variant="dummy",
+        action_dim=4,
+        action_horizon=3,
+        max_token_len=32,
+        num_latent=2,
+        max_prefix_len=8,
+        max_action_token_len=6,
+        max_cot_step_len=4,
+    )
+    model = config.create(key)
+    obs = config.fake_obs(batch_size=1)
+
+    action_tokens = nnx_utils.module_jit(model.sample_actions)(key, obs, max_decoding_steps=5)
+
+    assert action_tokens.shape == (1, 5)
+    assert np.issubdtype(np.asarray(action_tokens).dtype, np.integer)
+
+    class _FakeFastTokenizer:
+        def __init__(self):
+            self.calls = []
+
+        def extract_actions(self, tokens, action_horizon, action_dim):
+            self.calls.append(tokens.copy())
+            return np.full((action_horizon, action_dim), 7.0, dtype=np.float32)
+
+    fake_tokenizer = _FakeFastTokenizer()
+    extractor = _transforms.ExtractFASTActions(
+        fake_tokenizer,
+        action_horizon=config.action_horizon,
+        action_dim=config.action_dim,
+    )
+
+    decoded = extractor({"actions": np.asarray(action_tokens[0])})
+
+    assert len(fake_tokenizer.calls) == 1
+    np.testing.assert_array_equal(fake_tokenizer.calls[0], np.asarray(action_tokens[0], dtype=np.int32))
+    assert decoded["actions"].shape == (config.action_horizon, config.action_dim)
+    np.testing.assert_allclose(decoded["actions"], 7.0)
