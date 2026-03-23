@@ -16,6 +16,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_fast_implicit_cot as pi0_fast_implicit_cot
 import openpi.models.pi_cot as pi_cot
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -179,6 +180,39 @@ class ModelTransformFactory(GroupFactory):
                     outputs=[
                         _transforms.ExtractFASTActions(
                             tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
+                            action_horizon=model_config.action_horizon,
+                            action_dim=model_config.action_dim,
+                        )
+                    ],
+                )
+            case _model.ModelType.PI0_FAST_IMPLICIT_COT:
+                assert isinstance(model_config, pi0_fast_implicit_cot.Pi0FASTImplicitCoTConfig)
+                tokenizer_cls = (
+                    _tokenizer.FASTTokenizer
+                    if model_config.fast_model_tokenizer is None
+                    else model_config.fast_model_tokenizer
+                )
+                tokenizer_kwargs = (
+                    {} if model_config.fast_model_tokenizer_kwargs is None else model_config.fast_model_tokenizer_kwargs
+                )
+                fast_tokenizer = tokenizer_cls(
+                    model_config.max_token_len,
+                    teacher_cot_max_len=model_config.max_cot_tokens,
+                    action_postfix_max_len=model_config.max_action_postfix_tokens,
+                    **tokenizer_kwargs,
+                )
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizeFASTImplicitCoTInputs(
+                            tokenizer=fast_tokenizer,
+                            max_step_tokens=model_config.implicit_max_step_tokens,
+                        ),
+                    ],
+                    outputs=[
+                        _transforms.ExtractFASTActions(
+                            fast_tokenizer,
                             action_horizon=model_config.action_horizon,
                             action_dim=model_config.action_dim,
                         )
@@ -1127,10 +1161,83 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     TrainConfig(
+        name="pi0_fast_implicit_cot",
+        model=pi0_fast_implicit_cot.Pi0FASTImplicitCoTConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=256,
+            max_cot_tokens=512,
+            max_action_postfix_tokens=128,
+            implicit_max_step_tokens=96,
+            use_prj=True,
+        ),
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        num_train_steps=30_000,
+        num_workers=0,
+        weight_loader=weight_loaders.Pi0FASTImplicitCoTWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+    ),
+    TrainConfig(
+        name="pi0_fast_implicit_cot_lora",
+        model=pi0_fast_implicit_cot.Pi0FASTImplicitCoTConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=256,
+            max_cot_tokens=512,
+            max_action_postfix_tokens=128,
+            implicit_max_step_tokens=96,
+            use_prj=True,
+        ),
+        data=RLDSBridgeDataConfig(
+            repo_id="bridge_orig",
+            rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
+            reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=30_000,
+        num_workers=0,
+        weight_loader=weight_loaders.Pi0FASTImplicitCoTWeightLoader(
+            "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+        freeze_filter=pi0_fast_implicit_cot.Pi0FASTImplicitCoTConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=256,
+            max_cot_tokens=512,
+            max_action_postfix_tokens=128,
+            implicit_max_step_tokens=96,
+            use_prj=True,
+        ).get_freeze_filter(),
+    ),
+    TrainConfig(
         name="pi0_fast_bridge_rlds_finetune_cot",
 
         model=pi0_fast.Pi0FASTConfig(
-            action_dim=8,          # match your robot's action dimension
+            action_dim=7,          # match your robot's action dimension
             action_horizon=10,
             max_token_len=1024,     # must be large enough: prefix + CoT + actions
             use_cot=True,
@@ -1266,43 +1373,6 @@ _CONFIGS = [
 
         weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"),
     ),
-    # # Fine-tune PiCOT on Bridge dataset (RLDS format) with CoT reasoning.
-    # # Architecture: pi0.5-style flow matching + CoT tokens + FAST action tokens.
-    # # Weight loader: pi0.5 base checkpoint (shared dual-stream adaRMS architecture).
-    # TrainConfig(
-    #     name="pi_cot_bridge_rlds_finetune_cot",
-
-    #     model=pi_cot.PiCOTConfig(
-    #         action_dim=32,           # Bridge: 7-DoF arm + 1-DoF gripper
-    #         action_horizon=10,
-    #         max_token_len=200,      # prefix only (CoT + FAST are in separate arrays)
-    #         max_cot_tokens=512,     # match pi05_bridge_rlds_finetune_cot
-    #         max_fast_tokens=128,    # FAST typically ~10-20 tokens for (10, 8) actions
-    #         flow_matching_loss_weight=5.0,
-    #     ),
-
-    #     data=RLDSBridgeDataConfig(
-    #         repo_id="bridge_orig",
-    #         rlds_data_dir="/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_dataset_bridge",
-    #         reasoning_dataset_path="/inspire/hdd/global_user/gongjingjing-25039/zhdai/hf_cache/hub/datasets--Embodied-CoT--embodied_features_bridge/snapshots/854ee59c7c76868d63fac37c33e0f031ed678014/embodied_features_bridge.json",
-    #     ),
-
-    #     batch_size=32,
-    #     lr_schedule=_optimizer.CosineDecaySchedule(
-    #         warmup_steps=10_000,
-    #         peak_lr=5e-5,
-    #         decay_steps=1_000_000,
-    #         decay_lr=5e-5,
-    #     ),
-    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-    #     ema_decay=0.999,
-    #     num_train_steps=30_000,
-    #     num_workers=0,  # required for RLDS data loader
-
-    #     weight_loader=weight_loaders.CheckpointWeightLoader(
-    #         "/inspire/hdd/global_user/gongjingjing-25039/zhdai/openpi_cache/openpi-assets/checkpoints/pi05_base/params"
-    #     ),
-    # ),
     TrainConfig(
         name="pi_cot_bridge_rlds_finetune_cot_test",
 

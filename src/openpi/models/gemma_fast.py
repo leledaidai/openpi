@@ -29,11 +29,27 @@ import ml_collections
 import openpi.models.lora as lora
 import openpi.shared.array_typing as at
 
-Variant = Literal["gemma_2b", "gemma_2b_lora"]
+Variant = Literal["dummy", "gemma_2b", "gemma_2b_lora"]
 
 
 def get_config(variant):
     """Returns config for specified gemma variant."""
+    if variant == "dummy":
+        return ml_collections.ConfigDict(
+            {
+                "variant": variant,
+                "width": 64,
+                "depth": 4,
+                "mlp_dim": 128,
+                "num_heads": 8,
+                "num_kv_heads": 1,
+                "head_dim": 16,
+                "norm_eps": 1e-6,
+                "vocab_size": 2_048,
+                "scan": True,
+                "remat_policy": "none",
+            }
+        )
     if variant == "gemma_2b":
         return ml_collections.ConfigDict(
             {
@@ -258,7 +274,16 @@ class Block(nn.Module):
         else:
             self.drop = lambda x, _: x
 
-    def __call__(self, x, kv_cache, positions, attn_mask, decode, deterministic=True):  # noqa: FBT002
+    def __call__(
+        self,
+        x,
+        kv_cache,
+        positions,
+        attn_mask,
+        decode,
+        deterministic=True,  # noqa: FBT002
+        return_hidden_state=False,  # noqa: FBT002
+    ):
         x = nn.with_logical_constraint(x, ("act_batch", "act_len", "act_emb"))
         inputs_normalized = self.pre_attention_norm(x)
         attn_output, kv_cache = self.attn(inputs_normalized, positions, attn_mask, kv_cache, decode, deterministic)
@@ -269,6 +294,8 @@ class Block(nn.Module):
         outputs = self.mlp(attn_output)
         outputs = self.drop(outputs, deterministic)
         outputs = residual + outputs
+        if return_hidden_state:
+            return outputs, (kv_cache, outputs)
         return outputs, kv_cache
 
 
@@ -312,6 +339,7 @@ class Module(nn.Module):
         kv_cache=None,
         deterministic=True,  # noqa: FBT002
         return_prelogits=False,  # noqa: FBT002
+        return_hidden_states=False,  # noqa: FBT002
     ):
         """Embed only, or complete forward pass.
 
@@ -376,7 +404,7 @@ class Module(nn.Module):
             block_cls = nn.remat(
                 Block,
                 prevent_cse=not self.scan,
-                static_argnums=(5, 6),  # 0=self, 5=decode, 6=deterministic
+                static_argnums=(5, 6, 7),  # 0=self, 5=decode, 6=deterministic, 7=return_hidden_state
                 policy=getattr(jax.checkpoint_policies, self.remat_policy),
             )
 
@@ -391,24 +419,59 @@ class Module(nn.Module):
             "cache_dtype": self.cache_dtype,
             "lora_configs": self.lora_configs,
         }
-        layers = self.scope.push("layers")
-        blocks = [
-            nn.scan(
-                block_cls,
-                variable_axes={"params": 0},
-                split_rngs={"params": True, "dropout": True},
-                in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),  # 0=kv_cache, 1=positions, 2=mask
-                length=self.depth,
-            )(parent=layers, **block_kw)
-        ]
-        for block in blocks:
-            x, kv_cache = block(x, kv_cache, positions, mask, decode, deterministic)
+        hidden_states = [x] if return_hidden_states else None
+        scanned_hidden_states = None
+
+        if self.scan:
+            layers = self.scope.push("layers")
+            blocks = [
+                nn.scan(
+                    block_cls,
+                    variable_axes={"params": 0},
+                    split_rngs={"params": True, "dropout": True},
+                    in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),
+                    length=self.depth,
+                )(parent=layers, **block_kw)
+            ]
+            for block in blocks:
+                if return_hidden_states:
+                    x, (kv_cache, scanned_hidden_states) = block(
+                        x,
+                        kv_cache,
+                        positions,
+                        mask,
+                        decode,
+                        deterministic,
+                        True,
+                    )
+                else:
+                    x, kv_cache = block(x, kv_cache, positions, mask, decode, deterministic, False)
+        else:
+            for i in range(self.depth):
+                x, kv_cache = block_cls(name=f"layers_{i}", **block_kw)(
+                    x,
+                    kv_cache,
+                    positions,
+                    mask,
+                    decode,
+                    deterministic,
+                )
+                if hidden_states is not None:
+                    hidden_states.append(x)
 
         assert x.dtype == jnp.dtype(self.embed_dtype)  # Sanity check.
         out["encoded"] = x
 
         x = RMSNorm(name="final_norm")(x)
         out["pre_logits"] = x
+        if return_hidden_states:
+            if hidden_states is None:
+                hidden_states = []
+            if self.scan:
+                assert scanned_hidden_states is not None
+                hidden_states.extend(tuple(scanned_hidden_states))
+            hidden_states.append(x)
+            out["hidden_states"] = tuple(hidden_states)
         if return_prelogits:
             return x, kv_cache, out
 

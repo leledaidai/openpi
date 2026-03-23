@@ -1,8 +1,4 @@
-"""Chain-of-Thought utilities for OpenPI.
-
-This module provides utilities for handling Chain-of-Thought (CoT) reasoning in the model,
-including tag definitions, formatting, and data structure conversions.
-"""
+"""Chain-of-Thought utilities for OpenPI."""
 
 import enum
 
@@ -52,6 +48,11 @@ def get_cot_tags_list() -> list[str]:
     ]
 
 
+def get_implicit_cot_tags_list() -> list[str]:
+    """Get the fixed implicit-CoT step tags in order."""
+    return get_cot_tags_list()[:-1]
+
+
 def get_cot_database_keys() -> dict[str, str]:
     """Get mapping from CoT tags to database keys.
 
@@ -80,7 +81,7 @@ def format_reasoning_dict_to_string(reasoning_dict: dict[str, str]) -> str:
     Returns:
         Formatted string like "TASK: ... PLAN: ... MOVE REASONING: ..."
     """
-    tags = get_cot_tags_list()[:-1]  # Exclude ACTION tag
+    tags = get_implicit_cot_tags_list()
     database_keys = get_cot_database_keys()
     reasoning_parts = []
 
@@ -126,3 +127,25 @@ def parse_reasoning_string(reasoning_str: str) -> dict[str, str]:
         result[tag] = content
 
     return result
+
+
+def extract_implicit_cot_steps(reasoning_str: str) -> list[str]:
+    """Split a reasoning string into the fixed implicit-CoT step slots.
+
+    Missing steps are kept as empty strings. The returned step text keeps the
+    original tag prefix, e.g. ``"TASK: place the mug"``.
+    """
+    if not reasoning_str or not reasoning_str.strip():
+        return [""] * len(get_implicit_cot_tags_list())
+
+    parsed = parse_reasoning_string(reasoning_str)
+    steps = []
+    for tag in get_implicit_cot_tags_list():
+        content = parsed.get(tag, "").strip()
+        steps.append(f"{tag} {content}".strip() if content else "")
+    return steps
+
+
+def format_visible_reasoning_without_action(reasoning_str: str) -> str:
+    """Keep only the visible reasoning steps and drop the ACTION field entirely."""
+    return " ".join(step for step in extract_implicit_cot_steps(reasoning_str) if step)

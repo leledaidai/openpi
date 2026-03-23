@@ -48,6 +48,10 @@ def _pad_or_truncate_actions(actions: np.ndarray, action_dim: int) -> np.ndarray
     return np.pad(actions, pad_width=pad_width, mode="constant", constant_values=0.0)
 
 
+def _is_fast_model(model_type: _model.ModelType) -> bool:
+    return model_type in {_model.ModelType.PI0_FAST, _model.ModelType.PI0_FAST_IMPLICIT_COT}
+
+
 @dataclasses.dataclass(frozen=True)
 class BridgeInputs(transforms.DataTransformFn):
     """
@@ -83,8 +87,8 @@ class BridgeInputs(transforms.DataTransformFn):
                 # same masking rule as libero_policy:
                 # - For PI0_FAST: keep masks True even for padded images
                 # - For PI0 (non-fast): mask padded images False
-                "left_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
-                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+                "left_wrist_0_rgb": np.True_ if _is_fast_model(self.model_type) else np.False_,
+                "right_wrist_0_rgb": np.True_ if _is_fast_model(self.model_type) else np.False_,
             },
         }
 

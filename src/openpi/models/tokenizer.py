@@ -1,14 +1,17 @@
 import logging
 import os
+import pathlib
 
 import jax
 import numpy as np
 import orbax.checkpoint as ocp
 import sentencepiece
+import transformers.dynamic_module_utils as dynamic_module_utils
 from transformers import AutoProcessor
 
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
+from openpi.utils import cot_utils
 
 
 class PaligemmaTokenizer:
@@ -50,8 +53,17 @@ class PaligemmaTokenizer:
 
 
 class FASTTokenizer:
-    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+    def __init__(
+        self,
+        max_len: int = 256,
+        *,
+        teacher_cot_max_len: int | None = None,
+        action_postfix_max_len: int | None = None,
+        fast_tokenizer_path: str = "physical-intelligence/fast",
+    ):
         self._max_len = max_len
+        self._teacher_cot_max_len = teacher_cot_max_len or max_len
+        self._action_postfix_max_len = action_postfix_max_len or max_len
 
         # Download base PaliGemma tokenizer
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
@@ -59,8 +71,68 @@ class FASTTokenizer:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
         # Instantiate FAST tokenizer
-        self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
+        hf_modules_cache = pathlib.Path("/tmp/openpi_huggingface_modules")
+        hf_modules_cache.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_MODULES_CACHE", str(hf_modules_cache))
+        dynamic_module_utils.HF_MODULES_CACHE = str(hf_modules_cache)
+        resolved_fast_path = self._resolve_fast_tokenizer_path(fast_tokenizer_path)
+        if resolved_fast_path is not None:
+            self._fast_tokenizer = AutoProcessor.from_pretrained(
+                str(resolved_fast_path), trust_remote_code=True, local_files_only=True
+            )
+        else:
+            self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
         self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
+
+    def _resolve_fast_tokenizer_path(self, fast_tokenizer_path: str) -> pathlib.Path | None:
+        path = pathlib.Path(fast_tokenizer_path)
+        if path.exists():
+            return path.resolve()
+
+        if "/" not in fast_tokenizer_path:
+            return None
+
+        slug = f"models--{fast_tokenizer_path.replace('/', '--')}"
+        candidate_roots = []
+        if (hf_home := os.getenv("HF_HOME")):
+            candidate_roots.append(pathlib.Path(hf_home) / "hub")
+        if (hf_cache := os.getenv("HUGGINGFACE_HUB_CACHE")):
+            candidate_roots.append(pathlib.Path(hf_cache))
+        cwd = pathlib.Path.cwd().resolve()
+        candidate_roots.extend(parent / "hf_cache" / "hub" for parent in (cwd, *cwd.parents))
+        candidate_roots.extend(parent / ".cache" / "huggingface" / "hub" for parent in (cwd, *cwd.parents))
+
+        for root in candidate_roots:
+            snapshots_dir = root / slug / "snapshots"
+            if not snapshots_dir.exists():
+                continue
+            snapshots = sorted(snapshot for snapshot in snapshots_dir.iterdir() if snapshot.is_dir())
+            if snapshots:
+                return snapshots[-1]
+        return None
+
+    def _pad_tokens(
+        self,
+        token_ids: list[int],
+        max_len: int,
+        *,
+        name: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        token_count = len(token_ids)
+        if token_count > max_len:
+            logging.warning(
+                "%s length (%s) exceeds max length (%s), truncating.",
+                name,
+                token_count,
+                max_len,
+            )
+            token_ids = token_ids[:max_len]
+            token_count = max_len
+
+        pad_len = max_len - token_count
+        tokens = np.asarray(token_ids + [0] * pad_len, dtype=np.int32)
+        mask = np.asarray([True] * token_count + [False] * pad_len, dtype=np.bool_)
+        return tokens, mask
 
     def tokenize(
         self, prompt: str, state: np.ndarray, actions: np.ndarray | None,
@@ -147,6 +219,78 @@ class FASTTokenizer:
         if isinstance(tokens, list):
             tokens = np.array(tokens)
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
+
+    def decode_text_tokens(self, tokens: np.ndarray) -> str:
+        token_ids = np.asarray(tokens).astype(np.int32).tolist()
+        if 0 in token_ids:
+            token_ids = token_ids[: token_ids.index(0)]
+        return self._paligemma_tokenizer.decode(token_ids).strip()
+
+    def tokenize_implicit_cot(
+        self,
+        prompt: str,
+        state: np.ndarray,
+        actions: np.ndarray | None,
+        *,
+        cot_reasoning: str | None,
+        max_step_tokens: int,
+    ) -> dict[str, np.ndarray]:
+        """Tokenize inputs for CODI-style implicit CoT training."""
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
+        prefix_tokens, prefix_mask = self._pad_tokens(
+            self._paligemma_tokenizer.encode(prefix, add_bos=True),
+            self._max_len,
+            name="implicit-CoT prefix",
+        )
+
+        visible_reasoning = cot_utils.format_visible_reasoning_without_action(cot_reasoning or "")
+        teacher_cot_tokens, teacher_cot_mask = self._pad_tokens(
+            self._paligemma_tokenizer.encode(visible_reasoning, add_bos=False) if visible_reasoning else [],
+            self._teacher_cot_max_len,
+            name="teacher visible CoT",
+        )
+
+        if actions is not None:
+            action_token_ids = self._fast_tokenizer(actions[None])[0]
+            action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_token_ids)
+            postfix_ids = (
+                self._paligemma_tokenizer.encode("Action: ")
+                + action_tokens_in_pg.tolist()
+                + self._paligemma_tokenizer.encode("|", add_eos=True)
+            )
+        else:
+            postfix_ids = []
+        action_postfix_tokens, action_postfix_mask = self._pad_tokens(
+            postfix_ids,
+            self._action_postfix_max_len,
+            name="action postfix",
+        )
+
+        steps = cot_utils.extract_implicit_cot_steps(cot_reasoning or "")
+        step_tokens = []
+        step_masks = []
+        for step in steps:
+            token_ids = self._paligemma_tokenizer.encode(step, add_bos=False, add_eos=True) if step else []
+            tokens, mask = self._pad_tokens(token_ids, max_step_tokens, name="implicit CoT step")
+            step_tokens.append(tokens)
+            step_masks.append(mask)
+
+        has_cot = np.bool_(any(step for step in steps))
+
+        return {
+            "tokenized_prompt": prefix_tokens,
+            "tokenized_prompt_mask": prefix_mask,
+            "tokenized_teacher_cot": teacher_cot_tokens,
+            "tokenized_teacher_cot_mask": teacher_cot_mask,
+            "tokenized_action_postfix": action_postfix_tokens,
+            "tokenized_action_postfix_mask": action_postfix_mask,
+            "tokenized_implicit_cot_steps": np.stack(step_tokens, axis=0),
+            "tokenized_implicit_cot_steps_mask": np.stack(step_masks, axis=0),
+            "has_cot": has_cot,
+        }
 
     def tokenize_picot(
         self,

@@ -26,6 +26,10 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
+def _is_fast_model(model_type: _model.ModelType) -> bool:
+    return model_type in {_model.ModelType.PI0_FAST, _model.ModelType.PI0_FAST_IMPLICIT_COT}
+
+
 @dataclasses.dataclass(frozen=True)
 class LiberoInputs(transforms.DataTransformFn):
     """
@@ -65,7 +69,7 @@ class LiberoInputs(transforms.DataTransformFn):
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
                 # We only mask padding images for pi0 model, not pi0-FAST. Do not change this for your own dataset.
-                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+                "right_wrist_0_rgb": np.True_ if _is_fast_model(self.model_type) else np.False_,
             },
         }
 

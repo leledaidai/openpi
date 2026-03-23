@@ -49,7 +49,7 @@ class DroidInputs(transforms.DataTransformFn):
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
                 images = (base_image, wrist_image, np.zeros_like(base_image))
                 image_masks = (np.True_, np.True_, np.False_)
-            case _model.ModelType.PI0_FAST:
+            case _model.ModelType.PI0_FAST | _model.ModelType.PI0_FAST_IMPLICIT_COT:
                 names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
                 # We don't mask out padding images for FAST models.
                 images = (base_image, np.zeros_like(base_image), wrist_image)

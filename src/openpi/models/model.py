@@ -32,6 +32,7 @@ class ModelType(enum.Enum):
 
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
+    PI0_FAST_IMPLICIT_COT = "pi0_fast_implicit_cot"
     PI05 = "pi05"
     PI_COT = "pi_cot"
 
@@ -117,6 +118,15 @@ class Observation(Generic[ArrayT]):
     tokenized_fast_actions: at.Int[ArrayT, "*b fast_l"] | None = None
     tokenized_fast_actions_mask: at.Bool[ArrayT, "*b fast_l"] | None = None
 
+    # pi0-fast implicit CoT specific fields.
+    tokenized_teacher_cot: at.Int[ArrayT, "*b teacher_l"] | None = None
+    tokenized_teacher_cot_mask: at.Bool[ArrayT, "*b teacher_l"] | None = None
+    tokenized_action_postfix: at.Int[ArrayT, "*b action_l"] | None = None
+    tokenized_action_postfix_mask: at.Bool[ArrayT, "*b action_l"] | None = None
+    tokenized_implicit_cot_steps: at.Int[ArrayT, "*b step_count step_l"] | None = None
+    tokenized_implicit_cot_steps_mask: at.Bool[ArrayT, "*b step_count step_l"] | None = None
+    has_cot: at.Bool[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -141,6 +151,13 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             tokenized_fast_actions=data.get("tokenized_fast_actions"),
             tokenized_fast_actions_mask=data.get("tokenized_fast_actions_mask"),
+            tokenized_teacher_cot=data.get("tokenized_teacher_cot"),
+            tokenized_teacher_cot_mask=data.get("tokenized_teacher_cot_mask"),
+            tokenized_action_postfix=data.get("tokenized_action_postfix"),
+            tokenized_action_postfix_mask=data.get("tokenized_action_postfix_mask"),
+            tokenized_implicit_cot_steps=data.get("tokenized_implicit_cot_steps"),
+            tokenized_implicit_cot_steps_mask=data.get("tokenized_implicit_cot_steps_mask"),
+            has_cot=data.get("has_cot"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -224,6 +241,13 @@ def preprocess_observation(
         token_loss_mask=observation.token_loss_mask,
         tokenized_fast_actions=observation.tokenized_fast_actions,
         tokenized_fast_actions_mask=observation.tokenized_fast_actions_mask,
+        tokenized_teacher_cot=observation.tokenized_teacher_cot,
+        tokenized_teacher_cot_mask=observation.tokenized_teacher_cot_mask,
+        tokenized_action_postfix=observation.tokenized_action_postfix,
+        tokenized_action_postfix_mask=observation.tokenized_action_postfix_mask,
+        tokenized_implicit_cot_steps=observation.tokenized_implicit_cot_steps,
+        tokenized_implicit_cot_steps_mask=observation.tokenized_implicit_cot_steps_mask,
+        has_cot=observation.has_cot,
     )
 
 

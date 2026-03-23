@@ -376,6 +376,40 @@ class TokenizeFASTInputs(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeFASTImplicitCoTInputs(DataTransformFn):
+    tokenizer: _tokenizer.FASTTokenizer
+    max_step_tokens: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if (prompt := data.pop("prompt", None)) is None:
+            raise ValueError("Prompt is required")
+
+        if not isinstance(prompt, str):
+            if hasattr(prompt, "item"):
+                prompt = prompt.item()
+            if isinstance(prompt, bytes):
+                prompt = prompt.decode("utf-8")
+
+        cot_reasoning = data.pop("cot_reasoning", None)
+        if cot_reasoning is not None and not isinstance(cot_reasoning, str):
+            if hasattr(cot_reasoning, "item"):
+                cot_reasoning = cot_reasoning.item()
+            elif isinstance(cot_reasoning, bytes):
+                cot_reasoning = cot_reasoning.decode("utf-8")
+            else:
+                cot_reasoning = str(cot_reasoning)
+
+        result = self.tokenizer.tokenize_implicit_cot(
+            prompt,
+            data["state"],
+            data.get("actions"),
+            cot_reasoning=cot_reasoning,
+            max_step_tokens=self.max_step_tokens,
+        )
+        return {**data, **result}
+
+
+@dataclasses.dataclass(frozen=True)
 class ExtractFASTActions(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer
     action_horizon: int

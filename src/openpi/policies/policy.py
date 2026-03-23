@@ -54,6 +54,8 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._sample_actions_with_debug = None
+        self._decode_latent_step_token_ids = None
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -62,7 +64,13 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
-            self._rng = rng or jax.random.key(0)
+            self._sample_actions_with_debug = (
+                model.sample_actions_with_debug
+                if hasattr(model, "sample_actions_with_debug")
+                else None
+            )
+            self._decode_latent_step_token_ids = getattr(model, "decode_latent_step_token_ids", None)
+            self._rng = rng if rng is not None else jax.random.key(0)
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
@@ -89,10 +97,19 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
+        decode_latent_text = bool(sample_kwargs.pop("decode_latent_text", False))
+        if decode_latent_text and not self._is_pytorch_model and self._sample_actions_with_debug is not None:
+            debug_outputs = self._sample_actions_with_debug(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+            outputs = {
+                "state": inputs["state"],
+                "actions": debug_outputs["actions"],
+                "latent_step_token_ids": debug_outputs["latent_step_token_ids"],
+            }
+        else:
+            outputs = {
+                "state": inputs["state"],
+                "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            }
         model_time = time.monotonic() - start_time
 
         if self._is_pytorch_model:
@@ -100,11 +117,18 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
-        # Add CoT information if available (for debugging/visualization)
-        # Must be added AFTER jax.tree.map since bool is not subscriptable.
-        outputs["cot_enabled"] = hasattr(self._model, "use_cot") and self._model.use_cot
+        latent_step_token_ids = outputs.get("latent_step_token_ids")
 
         outputs = self._output_transform(outputs)
+        outputs["cot_enabled"] = hasattr(self._model, "use_cot") and self._model.use_cot
+        if (
+            decode_latent_text
+            and not self._is_pytorch_model
+            and latent_step_token_ids is not None
+            and self._decode_latent_step_token_ids is not None
+        ):
+            outputs["latent_step_token_ids"] = latent_step_token_ids
+            outputs["latent_step_texts"] = self._decode_latent_step_token_ids(latent_step_token_ids)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

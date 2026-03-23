@@ -73,6 +73,43 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
+@dataclasses.dataclass(frozen=True)
+class Pi0FASTImplicitCoTWeightLoader(WeightLoader):
+    """Load pi0-fast base weights into the implicit-CoT architecture.
+
+    The base pi0-fast checkpoint stores parameters under ``PaliGemma/llm`` and
+    ``PaliGemma/img``. The implicit-CoT model expects ``main_llm``, ``decoder_llm``
+    and ``img``. We copy the base LLM weights into both the shared policy LLM and
+    the independent decoder LLM, while leaving new parameters such as LoRA and
+    latent projection layers at their initialized values.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+        flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+
+        result = {}
+        for key, ref_value in flat_ref.items():
+            source_key = key
+            if key.startswith("main_llm/"):
+                source_key = f"PaliGemma/llm/{key.removeprefix('main_llm/')}"
+            elif key.startswith("decoder_llm/"):
+                source_key = f"PaliGemma/llm/{key.removeprefix('decoder_llm/')}"
+            elif key.startswith("img/"):
+                source_key = f"PaliGemma/img/{key.removeprefix('img/')}"
+
+            if source_key in flat_loaded:
+                value = flat_loaded[source_key]
+                result[key] = value.astype(ref_value.dtype) if value.dtype != ref_value.dtype else value
+            else:
+                result[key] = ref_value
+
+        return flax.traverse_util.unflatten_dict(result, sep="/")
+
+
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 
